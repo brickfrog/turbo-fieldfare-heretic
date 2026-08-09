@@ -54,14 +54,38 @@ struct ChatTemplateTests {
         #expect(sys.lowerBound < usr.lowerBound)
     }
 
-    @Test("System message after a user turn is rejected")
-    func misplacedSystemTurn() {
-        #expect(throws: GFTokenizerError.self) {
-            _ = try tok.applyChatTemplate([
-                Message(role: .user, content: "Hi"),
-                Message(role: .system, content: "Too late"),
-            ])
-        }
+    @Test("System message after a user turn renders in place as a user turn")
+    func misplacedSystemTurn() throws {
+        let p = try tok.applyChatTemplate([
+            Message(role: .user, content: "Hi"),
+            Message(role: .system, content: "Stay in character."),
+        ])
+        let first = p.range(of: "<|turn>user\nHi<turn|>")!
+        let second = p.range(of: "<|turn>user\nStay in character.<turn|>")!
+        #expect(first.lowerBound < second.lowerBound)
+        #expect(!p.contains("<|turn>system\nStay in character."))
+    }
+
+    @Test("Consecutive leading system messages are joined into one turn")
+    func mergedLeadingSystemTurns() throws {
+        let p = try tok.applyChatTemplate([
+            Message(role: .system, content: "Be terse."),
+            Message(role: .system, content: "A normal girl."),
+            Message(role: .system, content: "[Start a new Chat]"),
+            Message(role: .user, content: "hi"),
+        ])
+        #expect(p.contains(
+            "<|turn>system\nBe terse.\nA normal girl.\n[Start a new Chat]<turn|>"))
+        #expect(p.range(of: "<|turn>user\nhi<turn|>") != nil)
+    }
+
+    @Test("Empty system messages are dropped rather than emitting a blank turn")
+    func emptySystemTurnDropped() throws {
+        let p = try tok.applyChatTemplate([
+            Message(role: .system, content: "  "),
+            Message(role: .user, content: "hi"),
+        ])
+        #expect(!p.contains("<|turn>system"))
     }
 
     @Test("No Gemma 2/3 turn markers leak in")

@@ -422,12 +422,17 @@ public enum OpenAIRequestValidator {
                 throw invalid("unsupported message role \(message.role)",
                               "messages", "invalid_message")
             }
-            if role == .system || role == .developer {
+            // Local change: system guidance after the conversation starts used
+            // to be rejected. Chat clients place jailbreaks, author's notes and
+            // group nudges at a depth, and the tokenizer now renders those as
+            // user turns, so let them through. `developer` still has to lead,
+            // since it routes to the upstream jinja template unchanged.
+            if role == .developer {
                 guard !sawConversationMessage else {
-                    throw invalid("system or developer guidance must precede the conversation",
+                    throw invalid("developer guidance must precede the conversation",
                                   "messages", "invalid_message")
                 }
-            } else {
+            } else if role != .system {
                 sawConversationMessage = true
             }
             let content = try message.content?.textValue()

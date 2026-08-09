@@ -208,6 +208,94 @@ public final class KVCacheManager {
         position += count
     }
 
+    /// A copy of the live KV bytes plus the cursor they belong to.
+    ///
+    /// Local addition. The cursor alone cannot be rewound: SWA layers store at
+    /// `position % capacity`, so generating N tokens past P overwrites the
+    /// slots holding `[P - capacity, P - capacity + N)`. Attention at a rewound
+    /// P needs `[P - slidingWindow, P]`, which survives only while
+    /// `N <= capacity - slidingWindow` (128 tokens here). Restoring the bytes
+    /// sidesteps that entirely, and a ~570 MB copy at full context beats
+    /// re-prefilling the conversation by roughly three orders of magnitude.
+    public struct Snapshot: @unchecked Sendable {
+        fileprivate let k: [Data]
+        fileprivate let v: [Data]
+        fileprivate let position: Int
+        /// Live bytes held by this snapshot, for logging.
+        public var byteCount: Int {
+            k.reduce(0) { $0 + $1.count } + v.reduce(0) { $0 + $1.count }
+        }
+        public var tokenPosition: Int { position }
+    }
+
+    /// Bytes that must be preserved for `layer`. Ring layers wrap, so the whole
+    /// ring is live; linear layers only ever hold `[0, position)`.
+    private func liveByteCount(layer: Int) -> Int {
+        let tokens = ringCapacity(layer: layer) > 0
+            ? capacityTokens[layer]
+            : min(position, capacityTokens[layer])
+        return tokens * strides[layer]
+    }
+
+    public func snapshot() -> Snapshot {
+        var ks: [Data] = []
+        var vs: [Data] = []
+        ks.reserveCapacity(config.numLayers)
+        vs.reserveCapacity(config.numLayers)
+        for layer in 0..<config.numLayers {
+            let count = liveByteCount(layer: layer)
+            ks.append(Data(bytes: kBuffers[layer].contents(), count: count))
+            vs.append(Data(bytes: vBuffers[layer].contents(), count: count))
+        }
+        return Snapshot(k: ks, v: vs, position: position)
+    }
+
+    /// How far the cursor may be wound back without reading slots the ring has
+    /// already recycled. Restoring bytes then stepping back by at most this
+    /// much keeps `[position - slidingWindow, position]` intact.
+    public var safeRewindTokens: Int {
+        guard fp16RingEnabled else { return maxContext }
+        var slack = maxContext
+        for layer in 0..<config.numLayers where kinds[layer] == .swa {
+            let capacity = capacityTokens[layer]
+            // A ring sized for the whole context never recycles a slot, so
+            // nothing behind the cursor can have been overwritten.
+            guard capacity < maxContext else { continue }
+            slack = min(slack, max(0, capacity - config.slidingWindow))
+        }
+        return slack
+    }
+
+    /// Reinstate `snapshot`, optionally stepping the cursor back by `rewoundBy`
+    /// tokens. A resume needs at least one token left to prefill, so replaying
+    /// the exact prompt that produced the snapshot rewinds by 1.
+    public func restore(_ snapshot: Snapshot, rewoundBy rewind: Int = 0) {
+        precondition(snapshot.k.count == config.numLayers
+                        && snapshot.v.count == config.numLayers,
+                     "snapshot layer count does not match this cache")
+        precondition(snapshot.position <= maxContext,
+                     "snapshot position \(snapshot.position) exceeds maxContext \(maxContext)")
+        precondition(rewind >= 0 && rewind <= snapshot.position,
+                     "rewind \(rewind) outside snapshot of \(snapshot.position) tokens")
+        precondition(rewind <= safeRewindTokens,
+                     "rewind \(rewind) exceeds safe ring slack \(safeRewindTokens)")
+        for layer in 0..<config.numLayers {
+            copy(snapshot.k[layer], into: kBuffers[layer])
+            copy(snapshot.v[layer], into: vBuffers[layer])
+        }
+        position = snapshot.position - rewind
+    }
+
+    private func copy(_ data: Data, into buffer: MTLBuffer) {
+        guard !data.isEmpty else { return }
+        precondition(data.count <= buffer.length,
+                     "snapshot slice larger than its destination buffer")
+        data.withUnsafeBytes { raw in
+            guard let base = raw.baseAddress else { return }
+            buffer.contents().copyMemory(from: base, byteCount: raw.count)
+        }
+    }
+
     /// Drop all cached positions and return physical pages to the OS.
     ///
     /// No buffer zeroing — the attention kernels read only `[0, validTokenCount]`,

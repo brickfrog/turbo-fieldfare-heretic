@@ -386,9 +386,39 @@ public actor ServerModelSession: ServerInferenceBackend {
     private let promptCacheDomain: ServerPromptCacheDomain
     private var promptCache = ServerPromptCache()
 
+    /// Local addition: KV bytes as they stood the moment a prompt finished
+    /// prefilling, keyed by that prompt. Two things defeat the token cache in
+    /// normal chat use — stopping a reply mid-stream, and swiping for a reroll —
+    /// and both leave the KV holding tokens the next request does not want.
+    /// The cursor cannot simply be wound back (SWA layers recycle ring slots
+    /// after 128 tokens), but the bytes can be put back, which costs a memcpy
+    /// instead of a full re-prefill.
+    /// Both KV states of the last completed turn, keyed by the messages that
+    /// produced them. Keyed by messages rather than tokens on purpose: the KV
+    /// is built from the server's own generated token IDs, which a client
+    /// re-rendering the same conversation from text does not reproduce, so
+    /// token-prefix comparison diverges almost immediately.
+    private struct TurnSnapshot {
+        let messages: [GFTokenizer.Message]
+        let tools: [GFTokenizer.FunctionDefinition]
+        /// Tokens and KV as of the end of prefill, before any reply token.
+        /// Replaying these regenerates the same turn — a swipe.
+        let promptTokens: [Int32]
+        let beforeGeneration: KVCacheManager.Snapshot
+        /// KV once the reply was committed; the state `promptCache` describes.
+        let afterGeneration: KVCacheManager.Snapshot
+    }
+    private var lastTurn: TurnSnapshot?
+
+    private struct PrefillSnapshot {
+        let tokens: [Int32]
+        let kv: KVCacheManager.Snapshot
+    }
+
     public static func load(modelDirectory: URL,
                             maxContext: Int,
-                            promptCacheMode: ServerPromptCacheMode = .singlePrefix) async throws -> ServerModelSession {
+                            promptCacheMode: ServerPromptCacheMode = .singlePrefix,
+                            runtime runtimeOverride: RuntimeConfiguration? = nil) async throws -> ServerModelSession {
         let tokenizerFolder = GFTokenizer.tokenizerFolder(forModelDirectory: modelDirectory)
         guard let tokenizerFolder else {
             throw GFTokenizerError.missingToolTemplate
@@ -399,7 +429,7 @@ public actor ServerModelSession: ServerInferenceBackend {
         }
         let tokenizer = try await GFTokenizer.load(from: tokenizerFolder)
         let context = try MetalContext()
-        let runtime = RuntimeConfiguration(forceLogitsHead: true)
+        let runtime = runtimeOverride ?? RuntimeConfiguration(forceLogitsHead: true)
         let model = try Model.load(
             directoryURL: modelDirectory,
             device: context.device,
@@ -464,6 +494,80 @@ public actor ServerModelSession: ServerInferenceBackend {
         self.promptCacheDomain = promptCacheDomain
     }
 
+    /// True when `request` is a reroll of the last completed turn: identical
+    /// messages and tools, with no new turn appended. That is what a swipe
+    /// looks like, and the token cache can never serve it — there is nothing to
+    /// extend, only something to replay.
+    private func isSwipe(of request: ValidatedChatRequest) -> Bool {
+        guard let last = lastTurn else { return false }
+        return request.tools == last.tools
+            && request.messages.count == last.messages.count
+            && request.messages.elementsEqual(last.messages)
+    }
+
+    /// Rewind one token off the pre-generation snapshot so the resume has a
+    /// token left to prefill, and hand back the KV-space prompt to replay.
+    private func restoreForSwipe() -> (tokens: [Int32], resumeAt: Int)? {
+        guard let last = lastTurn, last.promptTokens.count > 1 else { return nil }
+        let resumeAt = last.promptTokens.count - 1
+        do {
+            try runner.restoreKVCache(last.beforeGeneration, rewoundBy: 1)
+            return (last.promptTokens, resumeAt)
+        } catch {
+            print("[prompt-cache] swipe restore failed: \(error)")
+            lastTurn = nil
+            runner.reset()
+            return nil
+        }
+    }
+
+    /// Local addition: explain why the single-prefix cache failed to match.
+    /// Read-only; used purely for the diagnostic log line.
+    private func promptCacheMissReason(_ request: ValidatedChatRequest,
+                                       _ renderedPromptIDs: [Int32]) -> String {
+        guard let entry = promptCache.entry else {
+            return "cold (no cached turn yet)"
+        }
+        guard entry.domain == promptCacheDomain else {
+            return "runtime/model domain changed"
+        }
+        guard entry.tools == request.tools else {
+            return "tool definitions changed"
+        }
+
+        let shared = zip(renderedPromptIDs, entry.kvBackedTokenIDs)
+            .prefix { $0.0 == $0.1 }.count
+        if shared < entry.kvBackedTokenIDs.count {
+            return "token \(shared) of \(entry.kvBackedTokenIDs.count) diverges"
+                + " (prompt prefix rewritten upstream)"
+        }
+
+        let cachedCount = entry.inputMessages.count
+        guard request.messages.count > cachedCount + 1 else {
+            return "history shrank: \(request.messages.count) messages vs"
+                + " cached \(cachedCount)+assistant (context truncation?)"
+        }
+        for i in 0..<cachedCount where request.messages[i] != entry.inputMessages[i] {
+            return "message[\(i)] role=\(request.messages[i].role.rawValue)"
+                + " edited since it was cached"
+        }
+        let incoming = request.messages[cachedCount]
+        guard incoming.role == .assistant else {
+            return "message[\(cachedCount)] is role=\(incoming.role.rawValue),"
+                + " expected the cached assistant turn"
+        }
+        if incoming.content != entry.assistantTurn.message.content {
+            return "assistant reply was modified before resend"
+                + " (regex script / markdown fixer / trim?)"
+        }
+        let continuation = request.messages.count - (cachedCount + 1)
+        if continuation != 1 {
+            return "\(continuation) new messages after the assistant turn;"
+                + " cache resumes only on exactly 1 new user turn"
+        }
+        return "structural match failed (stop reason \(entry.assistantTurn.rawStopReason))"
+    }
+
     public func generate(
         _ request: ValidatedChatRequest,
         onEvent: @escaping @Sendable (ServerInferenceEvent) -> Void
@@ -482,10 +586,31 @@ public actor ServerModelSession: ServerInferenceBackend {
     ) async throws -> ServerCompletion {
         let request = prepared.request
         var completed = false
+        // Captured once this request's prompt is fully prefilled, so an abort
+        // can put the KV back where it was instead of discarding everything.
+        var pendingSnapshot: PrefillSnapshot?
         defer {
             if !completed {
-                promptCache.invalidate()
-                runner.reset()
+                // Put the KV back to the end of the last completed turn. That
+                // is exactly the state `promptCache`'s entry describes, so the
+                // entry stays valid and the next turn resumes normally instead
+                // of re-prefilling the whole conversation.
+                if let last = lastTurn {
+                    do {
+                        try runner.restoreKVCache(last.afterGeneration)
+                        print("[prompt-cache] ABORT rolled back to last turn "
+                            + "(\(last.afterGeneration.tokenPosition) tokens, "
+                            + "\(last.afterGeneration.byteCount / 1_048_576) MB)")
+                    } catch {
+                        print("[prompt-cache] ABORT rollback failed: \(error)")
+                        promptCache.invalidate()
+                        lastTurn = nil
+                        runner.reset()
+                    }
+                } else {
+                    promptCache.invalidate()
+                    runner.reset()
+                }
             }
         }
         let needsToolTemplate = usesToolTemplate(request)
@@ -500,10 +625,30 @@ public actor ServerModelSession: ServerInferenceBackend {
                 renderedPromptIDs: promptIDs,
                 tokenizer: tokenizer) {
             case .miss:
+                // Local change: a miss silently re-prefills the whole
+                // conversation, which is the dominant cost in long chats.
+                // Before paying that, see whether this prompt matches a
+                // snapshot from an earlier prefill — a swipe, or a retry after
+                // a stopped stream — and restore the bytes instead. Otherwise
+                // say why we missed, so a client that rewrites the prompt each
+                // turn can be identified.
+                let reason = promptCacheMissReason(request, promptIDs)
                 promptCache.invalidate()
-                effectivePromptIDs = promptIDs
-                completionStart = .reset
+                if isSwipe(of: request), let swipe = restoreForSwipe() {
+                    print("[prompt-cache] SWIPE reused=\(swipe.resumeAt) "
+                        + "new=\(swipe.tokens.count - swipe.resumeAt) "
+                        + "total=\(swipe.tokens.count)")
+                    effectivePromptIDs = swipe.tokens
+                    completionStart = .resume(cachedPromptTokens: swipe.resumeAt)
+                } else {
+                    print("[prompt-cache] MISS prompt_tokens=\(promptIDs.count) "
+                        + "reason=\(reason)")
+                    effectivePromptIDs = promptIDs
+                    completionStart = .reset
+                }
             case .hit(let effective, let cached):
+                print("[prompt-cache] HIT reused=\(cached) "
+                    + "new=\(effective.count - cached) total=\(effective.count)")
                 effectivePromptIDs = effective
                 completionStart = .resume(cachedPromptTokens: cached)
             }
@@ -535,6 +680,10 @@ public actor ServerModelSession: ServerInferenceBackend {
         var calls: [ParsedToolCall] = []
         var decodingError: Error?
         var shouldStop = false
+        // Bound locally so the progress closure does not capture `self` and
+        // become actor-isolated; `runner` already crosses this boundary as
+        // `producer:` below.
+        let snapshotSource = runner
 
         let result = try await runRawCompletion(
             producer: runner,
@@ -549,8 +698,14 @@ public actor ServerModelSession: ServerInferenceBackend {
                 guard decodingError == nil else { return }
                 do {
                     switch progress {
-                    case .prefill:
-                        break
+                    case .prefill(let done, let total):
+                        // Snapshot once the prompt is fully resident, before
+                        // any generated token has moved the cursor.
+                        if done == total, pendingSnapshot == nil,
+                           let kv = snapshotSource.snapshotKVCache() {
+                            pendingSnapshot = PrefillSnapshot(
+                                tokens: effectivePromptIDs, kv: kv)
+                        }
                     case .token(_, let tokenID, let delta):
                         let events = if let decoder {
                             try decoder.consume(tokenID: tokenID, delta: delta)
@@ -639,6 +794,20 @@ public actor ServerModelSession: ServerInferenceBackend {
                 calls: calls,
                 result: result,
                 stopStringFiltered: stopMatcher.isStopped)
+            // Retain both KV states of this turn: the pre-generation one lets a
+            // swipe replay it, the post-generation one lets an aborted next
+            // turn roll back to it.
+            if let pending = pendingSnapshot,
+               let after = runner.snapshotKVCache() {
+                lastTurn = TurnSnapshot(
+                    messages: request.messages,
+                    tools: request.tools,
+                    promptTokens: pending.tokens,
+                    beforeGeneration: pending.kv,
+                    afterGeneration: after)
+            } else {
+                lastTurn = nil
+            }
         }
         completed = true
         return ServerCompletion(

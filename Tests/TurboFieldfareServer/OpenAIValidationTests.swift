@@ -508,4 +508,70 @@ struct ServerArgumentTests {
             ])
         }
     }
+
+    // Local addition: upstream exposed the runtime controls on the CLI in #100
+    // but left the server on defaults. These mirror CLIArgumentsTests.
+    @Test func runtimeControlsDefaultToProductionConfiguration() throws {
+        let arguments = try ServerArguments.parse(["--model", "model.gturbo"])
+        let production = RuntimeConfiguration.production
+        #expect(arguments.expertCacheSlots == production.expertCacheSlots)
+        #expect(arguments.expertCachePolicy == production.expertCachePolicy)
+        #expect(arguments.prefillPolicy == production.prefillPolicy)
+        #expect(arguments.prefillChunkTokens == production.prefillChunkTokens)
+        #expect(arguments.rdadvisePolicy == production.rdadvisePolicy)
+
+        let runtime = try arguments.resolvedRuntimeConfiguration(forceLogitsHead: true)
+        #expect(runtime.expertCacheSlots == production.expertCacheSlots)
+        #expect(runtime.headPath == .logits)
+    }
+
+    @Test func runtimeControlsParseAndReachTheConfiguration() throws {
+        let arguments = try ServerArguments.parse([
+            "--model", "model.gturbo",
+            "--expert-cache-slots", "32",
+            "--expert-cache-policy", "lru",
+            "--prefill-chunk-tokens", "64",
+            "--rdadvise", "adaptive",
+        ])
+        #expect(arguments.expertCacheSlots == 32)
+        #expect(arguments.expertCachePolicy == .lru)
+        #expect(arguments.prefillChunkTokens == 64)
+        #expect(arguments.rdadvisePolicy == .adaptive)
+
+        let runtime = try arguments.resolvedRuntimeConfiguration(forceLogitsHead: true)
+        #expect(runtime.expertCacheSlots == 32)
+        #expect(runtime.modelExpertCachePolicy == .lru)
+        #expect(runtime.prefillChunkTokens == 64)
+        #expect(runtime.rdadviseEnabled)
+    }
+
+    @Test func rejectsUnsupportedRuntimeControlValues() throws {
+        for bad in [["--expert-cache-slots", "20"],
+                    ["--expert-cache-policy", "mru"],
+                    ["--prefill-chunk-tokens", "96"],
+                    ["--prefill", "sometimes"],
+                    ["--rdadvise", "eager"]] {
+            #expect(throws: ServerArgumentError.self) {
+                try ServerArguments.parse(["--model", "model.gturbo"] + bad)
+            }
+        }
+    }
+
+    /// Chunked prefill needs at least 16 slots, so the combination has to fail
+    /// at startup rather than on the first request.
+    @Test func chunkedPrefillBelowSlotFloorIsRejectedAtParse() throws {
+        #expect(throws: ServerArgumentError.self) {
+            try ServerArguments.parse([
+                "--model", "model.gturbo",
+                "--expert-cache-slots", "8",
+            ])
+        }
+        let disabled = try ServerArguments.parse([
+            "--model", "model.gturbo",
+            "--expert-cache-slots", "8",
+            "--prefill", "off",
+        ])
+        #expect(disabled.expertCacheSlots == 8)
+        #expect(disabled.prefillPolicy == .off)
+    }
 }

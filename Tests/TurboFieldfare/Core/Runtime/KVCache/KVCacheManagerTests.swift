@@ -160,4 +160,84 @@ import Metal
         #expect(kv.position == 1)
     }
 
+    /// Stamp a recognizable byte into every layer's K and V at `position`.
+    private func stamp(_ kv: KVCacheManager, position: Int, byte: UInt8) {
+        for layer in 0..<config.numLayers {
+            let k = kv.kSlot(layer: layer, position: position)
+            let v = kv.vSlot(layer: layer, position: position)
+            k.buffer.contents().advanced(by: k.offset)
+                .assumingMemoryBound(to: UInt8.self).pointee = byte
+            v.buffer.contents().advanced(by: v.offset)
+                .assumingMemoryBound(to: UInt8.self).pointee = byte
+        }
+    }
+
+    private func readStamp(_ kv: KVCacheManager, position: Int, layer: Int) -> UInt8 {
+        let k = kv.kSlot(layer: layer, position: position)
+        return k.buffer.contents().advanced(by: k.offset)
+            .assumingMemoryBound(to: UInt8.self).pointee
+    }
+
+    @Test func snapshotRestore_returnsCursorAndBytes() throws {
+        let (_, kv) = try makeManager(maxContext: 256, fp16RingEnabled: true)
+        for position in 0..<40 {
+            stamp(kv, position: position, byte: 0xAA)
+            kv.advance()
+        }
+        let snapshot = kv.snapshot()
+        #expect(snapshot.tokenPosition == 40)
+
+        // Overwrite past the snapshot, as a generated reply would.
+        for position in 40..<70 {
+            stamp(kv, position: position, byte: 0xBB)
+            kv.advance()
+        }
+        #expect(kv.position == 70)
+
+        kv.restore(snapshot)
+        #expect(kv.position == 40)
+        // Bytes the snapshot covered come back untouched.
+        #expect(readStamp(kv, position: 10, layer: 0) == 0xAA)
+        #expect(readStamp(kv, position: 10, layer: 5) == 0xAA)
+        // And the generated tail is gone rather than lingering.
+        #expect(readStamp(kv, position: 45, layer: 0) != 0xBB)
+    }
+
+    @Test func restoreRewind_stepsCursorBackWithinSlack() throws {
+        let (_, kv) = try makeManager(maxContext: 256, fp16RingEnabled: true)
+        for position in 0..<40 {
+            stamp(kv, position: position, byte: 0xCC)
+            kv.advance()
+        }
+        let snapshot = kv.snapshot()
+        kv.advance(by: 20)
+
+        kv.restore(snapshot, rewoundBy: 1)
+        #expect(kv.position == 39)
+        #expect(readStamp(kv, position: 10, layer: 0) == 0xCC)
+    }
+
+    /// The ring recycles slots, so the cursor may only step back as far as the
+    /// slack between physical capacity and the sliding window.
+    @Test func safeRewindTokens_matchesRingSlack() throws {
+        let (_, ring) = try makeManager(maxContext: 4096, fp16RingEnabled: true)
+        #expect(ring.safeRewindTokens
+                == (config.slidingWindow + 128) - config.slidingWindow)
+
+        let (_, linear) = try makeManager(maxContext: 4096, fp16RingEnabled: false)
+        #expect(linear.safeRewindTokens == 4096)
+    }
+
+    @Test func snapshotSize_tracksLivePositionNotCapacity() throws {
+        let (_, kv) = try makeManager(maxContext: 8192, fp16RingEnabled: true)
+        kv.advance(by: 64)
+        let small = kv.snapshot().byteCount
+        kv.advance(by: 2048)
+        let large = kv.snapshot().byteCount
+        // Full-attention layers grow with the cursor; ring layers stay fixed,
+        // so the snapshot grows but by far less than the linear-storage total.
+        #expect(large > small)
+        #expect(large < kv.maxContext * 30 * 4096)
+    }
+
 }

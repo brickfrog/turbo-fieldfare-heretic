@@ -213,19 +213,53 @@ public struct GFTokenizer: @unchecked Sendable {
     private static let turnClose   = "<turn|>"
     private static let bosMark     = "<bos>"
 
+    /// Local change: upstream threw whenever a system message was not at index
+    /// 0, which disagreed with the server's own validator (that one permits any
+    /// number of system messages before the conversation starts). Clients like
+    /// SillyTavern routinely send several — a main prompt, a character
+    /// description, a scene marker — and the mismatch surfaced as a hung stream
+    /// rather than an error, because templating runs after the first chunk is
+    /// already on the wire. Leading system turns are now joined into one, and a
+    /// system turn arriving mid-conversation is rendered as a user turn so its
+    /// position is preserved.
     public func applyChatTemplate(_ messages: [Message]) throws -> String {
         var s = Self.bosMark
-        for (index, message) in messages.enumerated() {
+        var leadingSystem: [String] = []
+        var conversationStarted = false
+
+        func flushLeadingSystem() {
+            guard !leadingSystem.isEmpty else { return }
+            s += Self.turnOpen + "system\n"
+                + leadingSystem.joined(separator: "\n")
+                + Self.turnClose + "\n"
+            leadingSystem = []
+        }
+
+        for message in messages {
             guard let rawContent = message.content else {
                 throw GFTokenizerError.invalidChatTemplate("text-only messages require content")
             }
             let content = rawContent.trimmingCharacters(in: .whitespacesAndNewlines)
-            if message.role == .system && index != 0 {
-                throw GFTokenizerError.invalidChatTemplate("system message must be first")
+
+            if message.role == .system && !conversationStarted {
+                if !content.isEmpty { leadingSystem.append(content) }
+                continue
             }
-            let role = message.role == .assistant ? "model" : message.role.rawValue
+
+            flushLeadingSystem()
+            conversationStarted = true
+            if content.isEmpty { continue }
+
+            let role: String
+            switch message.role {
+            case .assistant: role = "model"
+            case .system: role = "user"
+            default: role = message.role.rawValue
+            }
             s += Self.turnOpen + role + "\n" + content + Self.turnClose + "\n"
         }
+
+        flushLeadingSystem()
         s += Self.turnOpen + "model\n<|channel>thought\n<channel|>"
         return s
     }

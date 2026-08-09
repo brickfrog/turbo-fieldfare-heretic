@@ -385,6 +385,29 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
         kv?.position ?? 0
     }
 
+    /// Local addition: capture / reinstate KV bytes so an abandoned generation
+    /// can be undone without re-prefilling. See `KVCacheManager.Snapshot`.
+    public func snapshotKVCache() -> KVCacheManager.Snapshot? {
+        kv?.snapshot()
+    }
+
+    public func restoreKVCache(_ snapshot: KVCacheManager.Snapshot,
+                               rewoundBy rewind: Int = 0) throws {
+        guard let kv else {
+            throw PrefillError.prefillCursorMismatch(
+                "restore requires an initialized KV cache")
+        }
+        guard rewind <= kv.safeRewindTokens else {
+            throw PrefillError.prefillCursorMismatch(
+                "rewind \(rewind) exceeds safe ring slack \(kv.safeRewindTokens)")
+        }
+        kv.restore(snapshot, rewoundBy: rewind)
+        resetTransientState()
+    }
+
+    /// Tokens the cursor may step back after a restore. 0 when no KV exists.
+    public var safeRewindTokens: Int { kv?.safeRewindTokens ?? 0 }
+
     public func prepareForContinuation(expectedPosition: Int) throws {
         guard let kv else {
             throw PrefillError.prefillCursorMismatch(
