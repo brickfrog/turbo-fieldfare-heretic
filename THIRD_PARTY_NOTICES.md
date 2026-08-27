@@ -36,13 +36,14 @@ The following table covers the complete graph reported by
 | [swift-jinja](https://github.com/huggingface/swift-jinja) | 2.3.6 | Apache-2.0 |
 | [swift-huggingface](https://github.com/huggingface/swift-huggingface) | 0.9.0 | Apache-2.0 |
 | [EventSource](https://github.com/mattt/EventSource) | 1.4.1 | MIT |
-| [swift-nio](https://github.com/apple/swift-nio) | 2.99.0 | Apache-2.0; upstream NOTICE applies |
+| [swift-nio](https://github.com/apple/swift-nio) | 2.101.3 | Apache-2.0; upstream NOTICE applies |
 | [swift-atomics](https://github.com/apple/swift-atomics) | 1.3.0 | Apache-2.0 with Runtime Library Exception |
 | [swift-collections](https://github.com/apple/swift-collections) | 1.5.1 | Apache-2.0 with Runtime Library Exception |
 | [swift-system](https://github.com/apple/swift-system) | 1.6.4 | Apache-2.0 with Runtime Library Exception |
 | [swift-crypto](https://github.com/apple/swift-crypto) | 4.5.0 | Apache-2.0; upstream NOTICE applies |
 | [swift-asn1](https://github.com/apple/swift-asn1) | 1.7.0 | Apache-2.0; upstream NOTICE applies |
 | [yyjson](https://github.com/ibireme/yyjson) | 0.12.0 | MIT |
+| [SwiftMath](https://github.com/mgriebling/SwiftMath) | revision `1d2c908` | MIT; bundled math fonts are GUST and OFL |
 
 No copyleft or custom non-commercial license was found in this resolved graph.
 The dependency license files remain authoritative. For binary distribution,

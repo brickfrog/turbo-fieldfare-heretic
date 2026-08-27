@@ -1,15 +1,22 @@
 import Darwin
 import Foundation
+import TurboFieldfare
 import TurboFieldfareServerCore
 
-// Local change: stdout is fully buffered when redirected to a file, so the
-// ready banner and per-request logs never appeared in `nohup` logs. Line
-// buffering costs nothing at this volume and makes the log usable live.
+// Every request line goes to stderr, which is unbuffered, while the ready line
+// below goes to stdout, which is fully buffered when it is not a terminal. A
+// server started with its output redirected therefore showed an empty log for
+// its whole life and printed "ready" only as it exited - exactly inverted from
+// what an operator needs. Line buffering puts the line where it is useful.
 setvbuf(stdout, nil, _IOLBF, 0)
 
 let arguments: ServerArguments
+let runtimeConfiguration: RuntimeConfiguration
 do {
     arguments = try ServerArguments.parse(Array(CommandLine.arguments.dropFirst()))
+    // Resolved here so an unusable flag combination exits with usage instead of
+    // failing after the model has started loading.
+    runtimeConfiguration = try arguments.resolvedRuntimeConfiguration()
 } catch ServerArgumentError.help {
     print(ServerArguments.usage)
     exit(0)
@@ -24,14 +31,26 @@ do {
     let backend = try await ServerModelSession.load(
         modelDirectory: modelURL,
         maxContext: arguments.maxContext,
+        visionPackURL: arguments.visionPack.map {
+            URL(fileURLWithPath: $0).standardizedFileURL
+        },
+        visionResidencyPolicy: arguments.visionResidency,
         promptCacheMode: arguments.promptCacheMode,
-        runtime: try arguments.resolvedRuntimeConfiguration(forceLogitsHead: true))
+        runtimeConfiguration: runtimeConfiguration)
     let server = TurboFieldfareHTTPServer(
         modelID: arguments.modelID,
         queueLimit: arguments.queueLimit,
-        backend: backend)
+        backend: backend,
+        visionCapability: backend.visionCapability)
     _ = try await server.start(port: arguments.port)
-    print("TurboFieldfareServer ready at http://127.0.0.1:\(arguments.port) model=\(arguments.modelID) context=\(arguments.maxContext) prompt_cache=\(arguments.promptCacheMode.rawValue) expert_cache=\(arguments.expertCacheSlots)/\(arguments.expertCachePolicy.rawValue) prefill=\(arguments.prefillPolicy.rawValue)/\(arguments.prefillChunkTokens) rdadvise=\(arguments.rdadvisePolicy.rawValue)")
+    print("TurboFieldfareServer ready at http://127.0.0.1:\(arguments.port) "
+        + "model=\(arguments.modelID) context=\(arguments.maxContext) "
+        + "prompt_cache=\(arguments.promptCacheMode.rawValue) "
+        + "expert_cache=\(arguments.expertCacheSlots)/\(arguments.expertCachePolicy.rawValue) "
+        + "prefill=\(arguments.prefillPolicy.rawValue)/\(arguments.prefillChunkTokens) "
+        + "rdadvise=\(arguments.rdadvisePolicy.rawValue) "
+        + "vision=\(backend.visionCapability) "
+        + "vision_residency=\(arguments.visionResidency.rawValue)")
 
     _ = await signals.wait()
     try await server.shutdown()

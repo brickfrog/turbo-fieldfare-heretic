@@ -148,17 +148,28 @@ package final class GTurboDirectoryAccess {
             }
             if name == "." || name == ".." { continue }
             let relativePath = prefix.isEmpty ? name : "\(prefix)/\(name)"
+            var info = stat()
+            guard fstatat(directoryFD, name, &info, AT_SYMLINK_NOFOLLOW) == 0 else {
+                // readdir returns a buffered snapshot, so an entry can be
+                // renamed or unlinked before this stat runs. A vanished entry
+                // is ordinary concurrent-directory behavior, not a damaged
+                // install, and reporting it also has to be skipped.
+                if errno == ENOENT { continue }
+                throw RepackError.fileStatFailed(
+                    path: "\(rootPath)/\(relativePath)", errno: errno)
+            }
             result.append(relativePath)
             guard result.count <= maxEntries else {
                 throw RepackError.configurationInvalid(detail: "artifact directory has too many entries")
             }
-            var info = stat()
-            guard fstatat(directoryFD, name, &info, AT_SYMLINK_NOFOLLOW) == 0 else {
-                throw RepackError.fileStatFailed(
-                    path: "\(rootPath)/\(relativePath)", errno: errno)
-            }
             if (info.st_mode & S_IFMT) == S_IFDIR {
                 if prefix.isEmpty, name == "tokenizer" { continue }
+                // Directory-shaped OS sidecars (.Spotlight-V100, .fseventsd,
+                // .TemporaryItems) land beside an artifact after any Finder or
+                // SMB round-trip. Descending into a Spotlight index is never
+                // right, and refusing the whole artifact over one is worse:
+                // list the entry so callers can filter it, and stop there.
+                if GTurboVisionFormatV1.isSidecarEntry(name) { continue }
                 guard depth < maxDepth else {
                     throw RepackError.configurationInvalid(
                         detail: "artifact directory nesting exceeds \(maxDepth)")
@@ -166,6 +177,14 @@ package final class GTurboDirectoryAccess {
                 let childFD = openat(directoryFD, name,
                                      O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
                 guard childFD >= 0 else {
+                    // Same snapshot race as the stat above, one level up: the
+                    // directory can be removed between fstatat and openat. Drop
+                    // the entry recorded for it rather than reporting a name
+                    // that no longer exists.
+                    if errno == ENOENT {
+                        result.removeLast()
+                        continue
+                    }
                     throw RepackError.fileOpenFailed(
                         path: "\(rootPath)/\(relativePath)", errno: errno)
                 }

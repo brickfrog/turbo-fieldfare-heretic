@@ -1,7 +1,7 @@
 # Optimizing a 14.3 GB model for an 8 GB machine
 
 TurboFieldfare runs Gemma 4 26B-A4B on an 8 GB Apple Silicon machine. Its
-text-only installation, without the vision tower, is about 14.3 GB. The model
+text installation, without the optional image pack, is about 14.3 GB. The model
 was never going to fit politely in memory.
 
 Instead, the runtime keeps 1.35 GB of common model weights available to Metal
@@ -201,16 +201,22 @@ K/V head across eight query heads, but the tiled kernel handled each query head
 separately. It launched eight threadgroups and read the same K/V data eight
 times.
 
-TensorOps processes all eight heads at once, making attention 11x faster at
-64K.
+On Apple10, TensorOps processes all eight heads at once, making attention 11x
+faster at 64K.
 
-The full runtime kept much of that gain. On the same 32K input, prefill fell
-from 491.09 to 204.29 seconds, a 2.404x speedup without increasing memory use.
+The full runtime kept much of that gain. On the same Apple10 32K input, prefill
+fell from 491.09 to 204.29 seconds, a 2.404x speedup without increasing memory
+use.
 
 We nearly threw this result away because the new reduction order changed the
 final logits slightly. Better checks showed the differences were harmless.
 
-TensorOps is now the Apple10 path. Earlier GPUs keep tiled attention.
+Production now selects TensorOps by pipeline capability rather than GPU family.
+The pipeline also compiles and dispatches on Apple8 M2, where it measured
+9.027-9.294x faster than tiled attention in isolation and reduced a matched
+6,784-token prefill from 419.469 to 243.100 seconds without increasing memory
+use. Incompatible shapes and stacks that cannot build the pipeline use tiled
+attention.
 
 ## Sampling removed repeated vocabulary scans
 

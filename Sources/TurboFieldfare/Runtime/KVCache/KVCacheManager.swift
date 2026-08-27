@@ -57,8 +57,10 @@ public final class KVCacheManager {
     private let strides:  [Int]         // bytes per token, per layer
     private let kinds:    [LayerKind]
     private let capacityTokens: [Int]
+    private let slidingWindowTokens: Int
 
     public private(set) var position: Int = 0
+    public private(set) var highWaterPosition: Int = 0
 
     private static let fp16Size = 2
 
@@ -81,6 +83,7 @@ public final class KVCacheManager {
         let swaCapacity = min(maxContext,
                               max(1, fp16RingCapacityOverride
                                   ?? ((slidingWindow ?? config.slidingWindow) + maxPrefillChunkTokens)))
+        self.slidingWindowTokens = slidingWindow ?? config.slidingWindow
 
         var ks: [MTLBuffer] = []
         var vs: [MTLBuffer] = []
@@ -206,6 +209,29 @@ public final class KVCacheManager {
         precondition(count >= 0, "advance count must be non-negative")
         precondition(position + count <= maxContext, "advance would exceed maxContext")
         position += count
+        highWaterPosition = max(highWaterPosition, position)
+    }
+
+    /// Maximum safe rewind before a reused SWA ring slot could become visible.
+    public var maxRewindTokens: Int {
+        guard fp16RingEnabled else { return maxContext }
+        var slack = maxContext
+        for layer in 0..<config.numLayers where kinds[layer] == .swa {
+            let capacity = capacityTokens[layer]
+            guard capacity < maxContext else { continue }
+            slack = min(slack, max(0, capacity - slidingWindowTokens))
+        }
+        return slack
+    }
+
+    /// Abandon the newest rows while keeping the remaining KV lineage intact.
+    public func rewind(to newPosition: Int) {
+        precondition(newPosition >= 0, "rewind target must be non-negative")
+        precondition(newPosition <= position,
+                     "rewind target \(newPosition) is beyond position \(position)")
+        precondition(highWaterPosition - newPosition <= maxRewindTokens,
+                     "rewind to \(newPosition) exceeds ring slack \(maxRewindTokens)")
+        position = newPosition
     }
 
     /// A copy of the live KV bytes plus the cursor they belong to.
@@ -221,6 +247,7 @@ public final class KVCacheManager {
         fileprivate let k: [Data]
         fileprivate let v: [Data]
         fileprivate let position: Int
+        fileprivate let highWaterPosition: Int
         /// Live bytes held by this snapshot, for logging.
         public var byteCount: Int {
             k.reduce(0) { $0 + $1.count } + v.reduce(0) { $0 + $1.count }
@@ -247,7 +274,11 @@ public final class KVCacheManager {
             ks.append(Data(bytes: kBuffers[layer].contents(), count: count))
             vs.append(Data(bytes: vBuffers[layer].contents(), count: count))
         }
-        return Snapshot(k: ks, v: vs, position: position)
+        return Snapshot(
+            k: ks,
+            v: vs,
+            position: position,
+            highWaterPosition: highWaterPosition)
     }
 
     /// How far the cursor may be wound back without reading slots the ring has
@@ -261,7 +292,7 @@ public final class KVCacheManager {
             // A ring sized for the whole context never recycles a slot, so
             // nothing behind the cursor can have been overwritten.
             guard capacity < maxContext else { continue }
-            slack = min(slack, max(0, capacity - config.slidingWindow))
+            slack = min(slack, max(0, capacity - slidingWindowTokens))
         }
         return slack
     }
@@ -284,6 +315,10 @@ public final class KVCacheManager {
             copy(snapshot.v[layer], into: vBuffers[layer])
         }
         position = snapshot.position - rewind
+        // The restored bytes belong to the snapshot's lineage, not to tokens
+        // generated after it. Keeping the abandoned high-water mark would make
+        // the upstream rewind guard reject otherwise safe future rewinds.
+        highWaterPosition = snapshot.highWaterPosition
     }
 
     private func copy(_ data: Data, into buffer: MTLBuffer) {
@@ -303,6 +338,7 @@ public final class KVCacheManager {
     /// releases resident memory between turns; pages fault back in on next write.
     public func reset() {
         position = 0
+        highWaterPosition = 0
         let pageSize = Int(getpagesize())
         var advised = Set<ObjectIdentifier>()
         for layer in 0..<config.numLayers {

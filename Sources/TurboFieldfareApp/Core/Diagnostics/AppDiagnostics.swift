@@ -47,11 +47,22 @@ public struct AppDiagnostics: Equatable, Sendable {
     public var generatedTokens: Int
     public var stopReason: AppStopReason
     public var promptTokenCount: Int?
+    /// Prompt tokens served from the retained KV instead of prefilled again.
+    /// Nil on the single-prompt path, where nothing is retained.
+    public var cachedPromptTokens: Int?
+    /// Tokens this turn put through prefill. A derivation of the two figures
+    /// beside it (`RawCompletion` computes `promptIds.count -
+    /// cachedPromptTokens`), so comparing it against them cannot fail. Carried
+    /// for reporting, not as evidence.
+    public var computedPrefillTokens: Int?
+    /// Tokens the conversation's KV holds after this turn.
+    public var conversationTokens: Int?
     public var prefillSeconds: Double?
     public var timeToFirstTokenSeconds: Double?
     public var decodeSeconds: Double
     public var tokensPerSecond: Double
     public var peakMemoryBytes: UInt64?
+    public var visionTowerMappedBytes: UInt64?
     public var runtimeOptions: AppRuntimeOptions
     public var prefill: PrefillExecutionDiagnostics?
     public var runner: AppRunnerDiagnostics?
@@ -62,36 +73,44 @@ public struct AppDiagnostics: Equatable, Sendable {
     }
 
     public var prefillTokensPerSecond: Double? {
-        guard let promptTokenCount,
-              promptTokenCount > 0,
+        guard let tokenCount = computedPrefillTokens ?? promptTokenCount,
+              tokenCount > 0,
               let prefillSeconds,
               prefillSeconds.isFinite,
               prefillSeconds > 0 else {
             return nil
         }
-        let rate = Double(promptTokenCount) / prefillSeconds
+        let rate = Double(tokenCount) / prefillSeconds
         return rate.isFinite ? rate : nil
     }
 
     public init(generatedTokens: Int,
                 stopReason: AppStopReason,
                 promptTokenCount: Int? = nil,
+                cachedPromptTokens: Int? = nil,
+                computedPrefillTokens: Int? = nil,
+                conversationTokens: Int? = nil,
                 prefillSeconds: Double? = nil,
                 timeToFirstTokenSeconds: Double?,
                 decodeSeconds: Double,
                 tokensPerSecond: Double,
                 peakMemoryBytes: UInt64?,
+                visionTowerMappedBytes: UInt64? = nil,
                 runtimeOptions: AppRuntimeOptions,
                 prefill: PrefillExecutionDiagnostics? = nil,
                 runner: AppRunnerDiagnostics? = nil) {
         self.generatedTokens = generatedTokens
         self.stopReason = stopReason
         self.promptTokenCount = promptTokenCount
+        self.cachedPromptTokens = cachedPromptTokens
+        self.computedPrefillTokens = computedPrefillTokens
+        self.conversationTokens = conversationTokens
         self.prefillSeconds = prefillSeconds
         self.timeToFirstTokenSeconds = timeToFirstTokenSeconds
         self.decodeSeconds = decodeSeconds
         self.tokensPerSecond = tokensPerSecond
         self.peakMemoryBytes = peakMemoryBytes
+        self.visionTowerMappedBytes = visionTowerMappedBytes
         self.runtimeOptions = runtimeOptions
         self.prefill = prefill
         self.runner = runner
@@ -106,6 +125,7 @@ public struct AppTokenEvent: Equatable, Sendable {
 
 public enum AppInferenceEvent: Equatable, Sendable {
     case prefillProgress(done: Int, total: Int)
+    case memorySample
     case token(AppTokenEvent)
     case finished(AppDiagnostics)
     case cancelled(AppDiagnostics)

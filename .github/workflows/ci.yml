@@ -29,5 +29,11 @@ jobs:
         run: swift build -c release
       - name: Run serial tests
         run: Scripts/test.sh
+      - name: Check for tracked symlinks
+        run: ruby Scripts/check_tracked_symlinks.rb
       - name: Check Markdown links
         run: ruby Scripts/check_markdown_links.rb
+      - name: Check the app version against the latest release
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: ruby Scripts/check_app_version.rb

@@ -9,6 +9,10 @@ final class MockInferenceClient: AppInferenceClient, @unchecked Sendable {
     var failureMessage: String?
     var prefillSteps: Int = 3
 
+    var opensAttachments = true
+    /// Holds the stream inside prefill so a cancel cannot race past it.
+    var holdsDuringPrefill = false
+
     private let lock = NSLock()
     private var activeTask: Task<Void, Never>?
     private var activeGenerationID: UUID?
@@ -35,6 +39,16 @@ final class MockInferenceClient: AppInferenceClient, @unchecked Sendable {
                 return
             }
 
+            if opensAttachments,
+               let unreadable = request.imageAttachments.first(where: { !Self.canOpen($0.fileURL) }) {
+                let appError = AppInferenceError.invalidRequest(
+                    "Image \(unreadable.displayName) could not be opened at "
+                        + unreadable.fileURL.path)
+                continuation.yield(.failed(appError, partial: nil))
+                continuation.finish(throwing: appError)
+                return
+            }
+
             lock.lock()
             if activeTask != nil {
                 lock.unlock()
@@ -56,6 +70,12 @@ final class MockInferenceClient: AppInferenceClient, @unchecked Sendable {
                 self?.cancel()
             }
         }
+    }
+
+    private static func canOpen(_ url: URL) -> Bool {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return false }
+        try? handle.close()
+        return true
     }
 
     func cancel() {
@@ -108,6 +128,9 @@ final class MockInferenceClient: AppInferenceClient, @unchecked Sendable {
             }
             try? await Task.sleep(nanoseconds: tokenDelayNanos)
             continuation.yield(.prefillProgress(done: step + 1, total: prefillSteps))
+                while holdsDuringPrefill, !Task.isCancelled {
+                    try? await Task.sleep(nanoseconds: 2_000_000)
+                }
         }
         prefillEndDate = Date()
 
@@ -168,10 +191,19 @@ final class MockInferenceClient: AppInferenceClient, @unchecked Sendable {
         _ = memorySampler.sample()
         let decodeStart = prefillEnd ?? start
         let decodeElapsed = max(Date().timeIntervalSince(decodeStart), 0)
+        let promptTokens = mockPromptTokenCount(request.prompt)
+        let committedGenerated = stopReason == .maxTokens ? max(0, generated - 1) : generated
+        let conversationTokens = request.continuesConversation
+            ? min(request.maxContextTokens,
+                  request.conversationTokens + promptTokens + committedGenerated)
+            : nil
         return AppDiagnostics(
             generatedTokens: generated,
             stopReason: stopReason,
-            promptTokenCount: mockPromptTokenCount(request.prompt),
+            promptTokenCount: promptTokens,
+            cachedPromptTokens: request.continuesConversation
+                ? request.conversationTokens : nil,
+            conversationTokens: conversationTokens,
             prefillSeconds: prefillEnd.map { max($0.timeIntervalSince(start), 0) },
             timeToFirstTokenSeconds: firstToken.map { max($0.timeIntervalSince(decodeStart), 0) },
             decodeSeconds: decodeElapsed,

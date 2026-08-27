@@ -28,6 +28,31 @@ public struct RawDecodeResult: Sendable {
     public let kvPosition: Int
     public let kvBackedTokenIDs: [Int32]
     public let uncommittedBoundaryTokenIDs: [Int32]
+    public let withheldTrailingKVTokens: Int
+
+    public init(prefillTokens: Int,
+                cachedPromptTokens: Int,
+                computedPrefillTokens: Int,
+                prefillSeconds: Double,
+                newTokens: Int,
+                decodeSeconds: Double,
+                reason: StopReason,
+                kvPosition: Int,
+                kvBackedTokenIDs: [Int32],
+                uncommittedBoundaryTokenIDs: [Int32],
+                withheldTrailingKVTokens: Int = 0) {
+        self.prefillTokens = prefillTokens
+        self.cachedPromptTokens = cachedPromptTokens
+        self.computedPrefillTokens = computedPrefillTokens
+        self.prefillSeconds = prefillSeconds
+        self.newTokens = newTokens
+        self.decodeSeconds = decodeSeconds
+        self.reason = reason
+        self.kvPosition = kvPosition
+        self.kvBackedTokenIDs = kvBackedTokenIDs
+        self.uncommittedBoundaryTokenIDs = uncommittedBoundaryTokenIDs
+        self.withheldTrailingKVTokens = withheldTrailingKVTokens
+    }
 }
 
 /// Preallocated per-generation buffers (two 512 KiB vocab buffers plus a token
@@ -81,6 +106,7 @@ extension GenerationConfig {
 public func runRawCompletion(producer: any LogitProducer,
                              tokenizer: GFTokenizer,
                              promptIds: [Int32],
+                             multimodalInput: MultimodalPrefillInput? = nil,
                              config: GenerationConfig,
                              context: MetalContext,
                              scratch: RawCompletionScratch,
@@ -114,9 +140,26 @@ public func runRawCompletion(producer: any LogitProducer,
         }
         cachedPromptTokens = count
     }
+    if let multimodalInput {
+        // Under resume the multimodal input is the tail that still has to be
+        // prefilled, so it must match the prompt suffix rather than the whole
+        // prompt. `prefillMultimodal` already prefills from `startPosition`.
+        guard multimodalInput.effectiveTokenIDs
+            == Array(promptIds.dropFirst(cachedPromptTokens)) else {
+            throw GeneratorError.invalidContinuation(
+                "multimodal effective token IDs do not match the prompt")
+        }
+    }
+    // Image spans are served only by the chunked prefill path, and a prefill
+    // config that cannot serve them is a performance setting, not a decision to
+    // drop the images.
+    let prefillConfig = multimodalInput == nil
+        ? prefillConfig
+        : (prefillConfig.coercedForImagePrompt() ?? prefillConfig)
     let computedPrefillTokens = promptIds.count - cachedPromptTokens
 
-    var detok = GFDetokenizer(tokenizer: tokenizer)
+    var detok = GFDetokenizer(tokenizer: tokenizer,
+                              barrierTokenIDs: tokenizer.structuralMarkerIDs)
     var history = Array(promptIds.prefix(cachedPromptTokens))
     history.reserveCapacity(promptIds.count + config.maxNewTokens)
 
@@ -137,8 +180,41 @@ public func runRawCompletion(producer: any LogitProducer,
     var position = cachedPromptTokens
     var prefillSeed: PrefillSeed?
     let prefillTokens = promptIds[cachedPromptTokens...]
-    switch prefillConfig.mode {
-    case .chunked where producer is any ChunkedPrefillRunner:
+    switch (multimodalInput, prefillConfig.mode) {
+    case (.some(let input), .chunked) where producer is any MultimodalPrefillRunner:
+        let multimodal = producer as! any MultimodalPrefillRunner
+        let mode: PrefillOutputMode = fusedGreedy ? .greedyIfAvailable : .logits
+        let result = try await multimodal.prefillMultimodal(
+            input: input,
+            startPosition: position,
+            outputMode: mode,
+            config: prefillConfig,
+            into: scratch.logits
+        ) { done in
+            // The suffix-local count plus what the KV already holds. Without the
+            // offset a 300-token image turn on a 5,000-token KV showed 1 of 5,300.
+            onProgress(.prefill(done: cachedPromptTokens + done,
+                                total: promptIds.count))
+        }
+        if mode == .logits, result.seed != .logitsWritten {
+            throw PrefillError.unsupportedPrefillSeed(
+                "RawCompletion multimodal prefill requested logits but producer returned \(result.seed)")
+        }
+        if case .greedyToken = result.seed, !config.isPureGreedy {
+            throw PrefillError.unsupportedPrefillSeed(
+                "RawCompletion multimodal prefill returned a greedy token for a sampling config")
+        }
+        position = result.newPosition
+        prefillSeed = result.seed
+        // Only the suffix: under resume the cached prefix is already in history,
+        // and appending the whole prompt would duplicate it.
+        history.append(contentsOf: prefillTokens)
+    case (.some, _):
+        // The coercion above leaves an image prompt in chunked mode, so the only
+        // way here is a producer that cannot run image spans at all.
+        throw PrefillError.chunkedUnsupported(
+            "multimodal prefill requires a MultimodalPrefillRunner-backed runtime")
+    case (.none, .chunked) where producer is any ChunkedPrefillRunner:
         let chunked = producer as! any ChunkedPrefillRunner
         let mode: PrefillOutputMode = fusedGreedy ? .greedyIfAvailable : .logits
         let result = try await chunked.prefillChunked(tokens: prefillTokens,
@@ -159,10 +235,10 @@ public func runRawCompletion(producer: any LogitProducer,
         position = result.newPosition
         prefillSeed = result.seed
         history.append(contentsOf: prefillTokens)
-    case .chunked:
+    case (.none, .chunked):
         throw PrefillError.chunkedUnsupported(
             PrefillError.chunkedRequiresChunkedRunnerReason)
-    case .off:
+    case (.none, .off):
         for t in prefillTokens {
             try Task.checkCancellation()
             try await producer.produce(token: t, position: position, into: scratch.logits)
@@ -178,6 +254,7 @@ public func runRawCompletion(producer: any LogitProducer,
     var generated = 0
     var reason: StopReason = .maxTokens
     var uncommittedBoundaryTokenIDs: [Int32] = []
+    var trailingInvisibleTokens = 0
 
     while true {
         try Task.checkCancellation()
@@ -217,16 +294,23 @@ public func runRawCompletion(producer: any LogitProducer,
         let visible = stopMatcher.push(delta)
         onProgress(.token(index: generated - 1, id: tokenID, delta: visible))
 
-        let hitStopString = stopMatcher.isStopped || shouldStop()
+        // Cancellation is not a stop-string match: reporting it as one made a
+        // user pressing Stop indistinguishable from a configured stop string,
+        // and `stopStringFiltered` is computed from `isStopped` rather than the
+        // reason, so the two disagreed about the same run.
+        let hitStopString = stopMatcher.isStopped
+        let cancelled = !hitStopString && shouldStop()
         let hitMax = generated >= config.maxNewTokens
-        if hitStopString || hitMax {
+        if hitStopString || cancelled || hitMax {
+            if !visible.isEmpty { trailingInvisibleTokens = 0 }
             let tail = stopMatcher.push(detok.flush()) + stopMatcher.finish()
             if !tail.isEmpty { onProgress(.tail(tail)) }
-            reason = hitStopString ? .stopString : .maxTokens
+            reason = hitStopString ? .stopString : (cancelled ? .cancelled : .maxTokens)
             break
         }
 
         history.append(tokenID)
+        trailingInvisibleTokens = visible.isEmpty ? trailingInvisibleTokens + 1 : 0
         try await producer.produce(token: tokenID, position: position, into: scratch.logits)
         position += 1
         uncommittedBoundaryTokenIDs.removeAll(keepingCapacity: true)
@@ -241,7 +325,9 @@ public func runRawCompletion(producer: any LogitProducer,
                            reason: reason,
                            kvPosition: position,
                            kvBackedTokenIDs: history,
-                           uncommittedBoundaryTokenIDs: uncommittedBoundaryTokenIDs)
+                           uncommittedBoundaryTokenIDs: uncommittedBoundaryTokenIDs,
+                           withheldTrailingKVTokens: reason == .stopString
+                               ? trailingInvisibleTokens : 0)
 }
 
 private func sampleOnce(scratch: RawCompletionScratch, context: MetalContext,
@@ -251,6 +337,6 @@ private func sampleOnce(scratch: RawCompletionScratch, context: MetalContext,
                            history: history, config: config, position: position,
                            outToken: scratch.outToken)
     cb.commit(); cb.waitUntilCompleted()
-    try checkCommandBufferError(cb.error)
+    try checkCommandBufferError(cb)
     return Int32(bitPattern: scratch.outToken.contents().load(as: UInt32.self))
 }

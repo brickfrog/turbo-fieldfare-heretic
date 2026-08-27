@@ -17,7 +17,13 @@ let package = Package(
     ],
     dependencies: [
         .package(url: "https://github.com/huggingface/swift-transformers", from: "1.3.0"),
-        .package(url: "https://github.com/apple/swift-nio.git", exact: "2.99.0"),
+        .package(url: "https://github.com/apple/swift-nio.git", exact: "2.101.3"),
+        // Pinned by revision: tag 1.7.3 predates the `\left...\right`
+        // duplication fix and typesets 433 of the 607-string coverage sweep
+        // against this revision's 479.
+        .package(
+            url: "https://github.com/mgriebling/SwiftMath.git",
+            revision: "1d2c90827e9c3908269d810d055fb03b7da5fd53"),
     ],
     targets: [
         .target(
@@ -29,6 +35,7 @@ let package = Package(
             dependencies: [
                 "TurboFieldfareFormat",
                 .product(name: "Tokenizers", package: "swift-transformers"),
+                .product(name: "Hub", package: "swift-transformers"),
             ],
             path: "Sources/TurboFieldfare",
             resources: [
@@ -66,7 +73,10 @@ let package = Package(
         ),
         .target(
             name: "TurboFieldfareMacPresentation",
-            dependencies: ["TurboFieldfareAppCore"],
+            dependencies: [
+                "TurboFieldfareAppCore",
+                .product(name: "SwiftMath", package: "SwiftMath"),
+            ],
             path: "Sources/TurboFieldfareApp/MacPresentation"
         ),
         .target(
@@ -119,8 +129,15 @@ let package = Package(
         ),
         .testTarget(
             name: "TurboFieldfareTestsCore",
-            dependencies: ["TurboFieldfare", "TurboFieldfareValidationSupport", "TurboFieldfareRepackCore", "TurboFieldfareCLICore"],
-            path: "Tests/TurboFieldfare/Core"
+            dependencies: [
+                "TurboFieldfare",
+                "TurboFieldfareValidationSupport",
+                "TurboFieldfareRepackCore",
+                "TurboFieldfareCLICore",
+                .product(name: "Hub", package: "swift-transformers"),
+            ],
+            path: "Tests/TurboFieldfare/Core",
+            resources: [.copy("Runtime/Vision/Fixtures/images")]
         ),
         .testTarget(
             name: "TurboFieldfareRepackTests",
@@ -140,7 +157,8 @@ let package = Package(
         .testTarget(
             name: "TurboFieldfareMacPresentationTests",
             dependencies: ["TurboFieldfareAppCore", "TurboFieldfareMacPresentation"],
-            path: "Tests/TurboFieldfareApp/MacPresentation"
+            path: "Tests/TurboFieldfareApp/MacPresentation",
+            resources: [.copy("Fixtures")]
         ),
         .testTarget(
             name: "TurboFieldfareServerTests",
