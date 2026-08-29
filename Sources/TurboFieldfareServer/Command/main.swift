@@ -42,8 +42,8 @@ do {
         queueLimit: arguments.queueLimit,
         backend: backend,
         visionCapability: backend.visionCapability)
-    _ = try await server.start(port: arguments.port)
-    print("TurboFieldfareServer ready at http://127.0.0.1:\(arguments.port) "
+    _ = try await server.start(host: arguments.host, port: arguments.port)
+    print("TurboFieldfareServer ready at http://\(arguments.host):\(arguments.port) "
         + "model=\(arguments.modelID) context=\(arguments.maxContext) "
         + "prompt_cache=\(arguments.promptCacheMode.rawValue) "
         + "expert_cache=\(arguments.expertCacheSlots)/\(arguments.expertCachePolicy.rawValue) "

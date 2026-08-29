@@ -35,10 +35,9 @@ checks, client setup, prompt reuse, tool loops, and supported API behavior.
 Apply the model-process checks below first; never start a second model process
 or terminate an existing one.
 
-Keep the server on `127.0.0.1`; it has no remote authentication or TLS, so do
-not proxy, tunnel, or expose it. A tool call from the local model never bypasses
-the client's normal permission policy. Keep the execution session alive while
-the server is needed, and stop only a server you launched.
+A tool call from the local model never bypasses the client's normal permission
+policy. Keep the execution session alive while the server is needed, and stop
+only a server you launched.
 
 ## Test rules
 

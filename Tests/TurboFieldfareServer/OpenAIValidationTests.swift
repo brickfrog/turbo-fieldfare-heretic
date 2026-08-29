@@ -677,6 +677,7 @@ struct StreamingStopMatcherTests {
 struct ServerArgumentTests {
     @Test func defaults() throws {
         let arguments = try ServerArguments.parse(["--model", "model.gturbo"])
+        #expect(arguments.host == "127.0.0.1")
         #expect(arguments.port == 8080)
         #expect(arguments.maxContext == 16_384)
         #expect(arguments.queueLimit == 4)
@@ -686,6 +687,20 @@ struct ServerArgumentTests {
         #expect(arguments.prefillPolicy == .chunked)
         #expect(arguments.prefillChunkTokens == 128)
         #expect(arguments.rdadvisePolicy == .off)
+    }
+
+    @Test func parsesLANBindAddressAndRejectsAnEmptyHost() throws {
+        let arguments = try ServerArguments.parse([
+            "--model", "model.gturbo",
+            "--host", "0.0.0.0",
+        ])
+        #expect(arguments.host == "0.0.0.0")
+        #expect(throws: ServerArgumentError.self) {
+            try ServerArguments.parse([
+                "--model", "model.gturbo",
+                "--host", "",
+            ])
+        }
     }
 
     @Test func parsesSinglePrefixModeAndRejectsUnknownMode() throws {

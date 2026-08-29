@@ -1,8 +1,7 @@
 # Local OpenAI-compatible server
 
 `TurboFieldfareServer` exposes a local Chat Completions API for one Gemma
-model. It binds to `127.0.0.1` without authentication or TLS. Do not expose it
-through a proxy or tunnel.
+model. It binds to `127.0.0.1` by default and has no authentication or TLS.
 
 ## Start the server
 
@@ -26,6 +25,21 @@ swift build -c release --product TurboFieldfareServer
 The server loads the model before opening the port. Wait for
 `TurboFieldfareServer ready`, then keep the process running while clients use
 it.
+
+To accept clients from the local network, bind all interfaces explicitly:
+
+```bash
+.build/release/TurboFieldfareServer \
+  --model scratch/gemma4.gturbo \
+  --host 0.0.0.0 \
+  --port 8080 \
+  --max-context 16384
+```
+
+LAN clients connect to the Mac's LAN address, such as
+`http://192.168.1.20:8080/v1`, rather than `0.0.0.0`. Because the server has no
+authentication or TLS, use this only on a trusted local network and restrict
+incoming access with the host firewall.
 
 Check the server from another terminal:
 
