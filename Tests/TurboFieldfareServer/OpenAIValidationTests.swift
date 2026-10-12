@@ -1282,6 +1282,7 @@ struct ServerArgumentTests {
                      namesAuto: Bool)] = [
             (flag: "--expert-cache-slots",
              arguments: ServerArguments(model: "model.gturbo",
+                                        host: "127.0.0.1",
                                         port: 8080,
                                         modelID: "gemma-4-26b-a4b-it",
                                         maxContext: 16_384,
@@ -1298,6 +1299,7 @@ struct ServerArgumentTests {
              namesAuto: false),
             (flag: "--prefill-chunk-tokens",
              arguments: ServerArguments(model: "model.gturbo",
+                                        host: "127.0.0.1",
                                         port: 8080,
                                         modelID: "gemma-4-26b-a4b-it",
                                         maxContext: 16_384,
