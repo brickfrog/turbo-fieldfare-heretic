@@ -12,7 +12,7 @@ The Mac app and CLI expose these generation controls:
 | Control | Mac values | CLI flag | Default | Effect |
 | --- | --- | --- | --- | --- |
 | Maximum response | Automatic | `--max-new` | App: remaining context; CLI: 1,024 tokens | The app can use the context space left after the retained conversation and new turn. The CLI uses its explicit or default `--max-new` limit. |
-| Maximum context | 4K, 8K, 16K, 32K, 64K | `--max-context` | CLI and app: 8K; server: 16K | Sets conversation or prompt plus response capacity, and 8K is what leaves room for an image and its prompt. The app shows the FP16 KV-memory delta. The server defaults higher still because agent clients routinely send prompts near 8K on their own. |
+| Maximum context | 4K, 8K, 16K, 32K, 64K, 128K, 256K, depending on your Mac's RAM and cache settings | `--max-context` | CLI and app: 8K; server: 16K | Sets the combined capacity for the prompt or conversation and the response. The app shows how much FP16 KV-cache memory each size adds. The server defaults to 16K because agent clients routinely send prompts near 8K. |
 | Temperature | 0...2 in 0.05 steps | `--temperature` | 0.2 | `0` is greedy; positive values sample. |
 | Top-K | Off or 1...256 | `--top-k` | 64 | Keeps at most K candidates. CLI `0` turns it off. |
 | Top-P | Off or 0.01...1 | `--top-p` | 0.95 | Applies nucleus truncation before Top-K and is effective only while Top-K is enabled. |
@@ -35,7 +35,7 @@ model, so an unsupported combination fails immediately with the usage text.
 | Expert-cache slots | 8, 16, 24, 32 | `--expert-cache-slots` | 16 | More slots can retain more routed experts and reduce later reads, but values above 16 use more RAM. Chunked prefill requires at least 16 slots. |
 | Expert-cache policy | LFU | `--expert-cache-policy lfu\|lru` | LFU | Chooses which expert is evicted when the cache is full. |
 | Prompt prefill | On, off | `--prefill on\|off` | On | On processes known prompt tokens through the chunked prefill path. Off disables that path. |
-| Prefill chunk size | 128 | `--prefill-chunk-tokens 32\|64\|128\|256\|auto` | 128 | Sets the number of prompt tokens processed by each chunked-prefill step, and has no effect while prefill is off. Chunks loop outside layers, so each one re-reads that layer's routed experts: fewer, larger chunks read less. `auto` picks the smallest size that covers the prompt. On a 7,019-token prompt, 256 measured 16% faster than 128 with byte-identical output. |
+| Prefill chunk size | 128 | `--prefill-chunk-tokens 32\|64\|128\|256\|auto` | 128 | Sets the number of prompt tokens processed by each chunked-prefill step, and has no effect while prefill is off. Chunks loop outside layers, so each one re-reads that layer's routed experts: fewer, larger chunks read less. `auto` picks the smallest size that covers the prompt. On the server `auto` is the cap, 256: a per-request size is the smallest allowed size covering the span, so the cap prefills every prompt in exactly those spans, and the KV ring is sized from the cap either way. Only the prefill scratch is sized from the chunk, at about 125.5 KB per token over a fixed 328 KB, so the cap holds about 32.5 MB of it against 16.4 MB at 128, and a per-request size would reallocate it whenever the chosen size moved. On a 7,019-token prompt, 256 measured 16% faster than 128 with byte-identical output. |
 | RDADVISE | Off, Default, Bounded, Adaptive | `--rdadvise off\|default\|bounded\|adaptive` | Off | Applies experimental read advice. Its effect depends on the workload; it may help a short decode and slow a long one. |
 
 In the app, changing context length, expert-cache slots, or RDADVISE requires a
@@ -45,7 +45,9 @@ each turn and do not require a reload. A reload ends the retained KV lineage;
 the app preserves the visible transcript and marks where the model's new
 context begins. Each CLI invocation loads a new model process, so its selected
 runtime settings apply immediately. The server fixes its runtime settings at
-startup, so changing one means restarting the process.
+startup, so changing one means restarting the process;
+`--prefill-chunk-tokens auto` resolves to the cap, 256, there, which allocates
+about 32.5 MB of prefill scratch against about 16.4 MB at the 128 default.
 
 ### macOS interactivity mitigation
 
@@ -110,3 +112,33 @@ During chunked prefill, the phase label reports exact progress, for example
 `Prefill (128/514)`. Errors and unsupported configurations appear only when
 they occur. RDADVISE remains experimental and is off by default. A measured
 result is a data point, not a performance ceiling.
+
+## Context length and memory
+
+Use the default context unless you need a longer conversation: 8K in the app
+and CLI, or 16K in the server.
+
+The model supports up to 256K tokens, but larger contexts need more RAM. The
+KV cache is allocated when the model loads, even if the conversation is empty.
+The server also offers 96K and 192K.
+
+The memory check includes the KV cache, 2 GiB for the runtime with 16
+expert-cache slots, and 3 GiB for macOS and the file cache. Choosing 24 or 32
+slots adds about 0.75 or 1.50 GiB. On an 8 GB Mac, neither leaves enough room
+for 128K under this estimate.
+
+When a setting exceeds the estimate:
+
+- The app hides it and lowers an incompatible saved setting, with a notice.
+- The server refuses to load.
+- The CLI warns but continues.
+
+For diagnostic runs, `TURBO_FIELDFARE_ALLOW_UNBACKED_CONTEXT=1` bypasses the
+server check.
+
+Passing the check doesn't guarantee enough free memory: it uses total RAM,
+and other apps need memory too. Answer quality at 256K and memory use at 128K
+on an 8 GB Mac still need testing. See the
+[long-context report](experiments/summaries/10-long-context.md).
+
+The app allows up to 32 images per message. The remaining context may fit fewer.

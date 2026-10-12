@@ -14,23 +14,86 @@ import TurboFieldfare
         let directory = try makeVisionReadyModelInstall("capacity-\(option.tokens)")
         defer { try? FileManager.default.removeItem(at: directory) }
         let model = AppModel(modelDirectory: directory)
-        model.maxContextTokens = option.tokens
+        model.setMaxContextTokens(option.tokens)
 
         let expected = VisionImageTokenBudget.capacity(
             maxContext: option.tokens,
-            reservedTextTokens: AppModel.reservedPromptTokens)
+            reservedTextTokens: AppModel.reservedPromptTokens
+                + ConversationGenerationReserve.tokens)
         #expect(model.maximumImageAttachments == expected)
     }
 
     @Test func capacityReachesZeroAtTheConversationBoundary() {
         let context = AppContextLengthOption.fourK.tokens
         let imageCost = VisionImageTokenBudget.maximumTokensPerImage
+        let reserve = ConversationGenerationReserve.tokens
         #expect(AppModel.imageAttachmentCapacity(
             maxContextTokens: context,
-            conversationTokens: context - imageCost) == 1)
+            conversationTokens: context - imageCost - reserve) == 1)
         #expect(AppModel.imageAttachmentCapacity(
             maxContextTokens: context,
-            conversationTokens: context - imageCost + 1) == 0)
+            conversationTokens: context - imageCost - reserve + 1) == 0)
+    }
+
+    /// What the composer offers, `generate` accepts: the images, the text
+    /// they sit behind and the reply's reserve all fit the context. Without
+    /// the reserve the composer offered sets the runtime refused after every
+    /// image had been encoded.
+    @Test func whatTheComposerOffersLeavesTheReplyItsReserve() {
+        let imageCost = VisionImageTokenBudget.maximumTokensPerImage
+        for context in AppContextLengthOption.allCases.map(\.tokens) {
+            for held in stride(from: 0, through: context, by: 97) {
+                let capacity: Int = AppModel.imageAttachmentCapacity(
+                    maxContextTokens: context, conversationTokens: held)
+                let text: Int = max(AppModel.reservedPromptTokens, held)
+                guard ConversationGenerationReserve.fits(tokens: text, maxContext: context) else {
+                    // The text alone leaves no room to reply; no image may be
+                    // offered on top of it.
+                    #expect(capacity == 0, "\(capacity) images offered at \(held) held tokens of \(context)")
+                    continue
+                }
+                let images: Int = capacity * imageCost
+                let prompt: Int = text + images
+                #expect(ConversationGenerationReserve.fits(
+                    tokens: prompt, maxContext: context),
+                    "\(capacity) images at \(held) held tokens do not fit \(context)")
+            }
+        }
+    }
+
+    /// The context-derived budget is unbounded in the context: at 262,144
+    /// tokens the arithmetic alone offers about 930 images in one message. The
+    /// absolute per-turn cap is what stops that, and it binds only once the
+    /// context is large enough for it to.
+    @Test func theperTurnCapBoundsWhatALargeContextWouldOffer() {
+        #expect(VisionImageTokenBudget.capacity(
+            maxContext: 262_144, reservedTextTokens: 0)
+            == VisionImageTokenBudget.maximumAttachmentsPerTurn)
+        #expect(VisionImageTokenBudget.maximumAttachmentsPerTurn == 32)
+
+        // One token below where the cap starts binding, the context is still
+        // the thing that decides.
+        let atTheCap = VisionImageTokenBudget.maximumTokensPerImage
+            * VisionImageTokenBudget.maximumAttachmentsPerTurn
+        #expect(VisionImageTokenBudget.capacity(
+            maxContext: atTheCap, reservedTextTokens: 0) == 32)
+        #expect(VisionImageTokenBudget.capacity(
+            maxContext: atTheCap - 1, reservedTextTokens: 0) == 31)
+    }
+
+    @MainActor
+    @Test func thecapReachesTheComposerMessageInsteadOfAdviceToRaiseTheContext() {
+        let capped = AppModel.imageCapacityMessage(
+            capacity: VisionImageTokenBudget.maximumAttachmentsPerTurn,
+            context: 262_144)
+        #expect(capped.contains("32"))
+        #expect(!capped.contains("Raise"),
+                "raising the context cannot lift the per-turn cap")
+        // Below the cap the context really is the reason, and saying so is how
+        // the user knows what to change.
+        let contextBound = AppModel.imageCapacityMessage(capacity: 10, context: 4_096)
+        #expect(contextBound.contains("4K"))
+        #expect(contextBound.contains("Raise"))
     }
 
     @Test func unknownConversationPositionHasNoImageCapacity() {
@@ -45,9 +108,9 @@ import TurboFieldfare
         defer { try? FileManager.default.removeItem(at: directory) }
         let model = AppModel(modelDirectory: directory)
 
-        model.maxContextTokens = AppContextLengthOption.fourK.tokens
+        model.setMaxContextTokens(AppContextLengthOption.fourK.tokens)
         let small = model.maximumImageAttachments
-        model.maxContextTokens = AppContextLengthOption.sixtyFourK.tokens
+        model.setMaxContextTokens(AppContextLengthOption.sixtyFourK.tokens)
         let large = model.maximumImageAttachments
         #expect(large > small,
                 "raising the context did not raise the image capacity")
@@ -62,10 +125,10 @@ import TurboFieldfare
         let directory = try makeVisionReadyModelInstall("capacity-agreement")
         defer { try? FileManager.default.removeItem(at: directory) }
         let model = AppModel(modelDirectory: directory)
-        model.maxContextTokens = AppContextLengthOption.eightK.tokens
+        model.setMaxContextTokens(AppContextLengthOption.eightK.tokens)
 
         let attachments = (0..<model.maximumImageAttachments).map { index in
-            AppImageAttachment(
+            StagedImage(
                 fileURL: URL(fileURLWithPath: "/tmp/image-\(index).png"),
                 displayName: "image-\(index).png",
                 encodedBytes: 1,
@@ -89,7 +152,7 @@ import TurboFieldfare
         let capacity = VisionImageTokenBudget.capacity(
             maxContext: context, reservedTextTokens: 0)
         let attachments = (0...capacity).map { index in
-            AppImageAttachment(
+            StagedImage(
                 fileURL: URL(fileURLWithPath: "/tmp/image-\(index).png"),
                 displayName: "image-\(index).png",
                 encodedBytes: 1,
@@ -119,7 +182,7 @@ import TurboFieldfare
         let store = AppImageAttachmentStore(
             directoryURL: root.appendingPathComponent("staged", isDirectory: true))
         let model = AppModel(modelDirectory: directory, attachmentStore: store)
-        model.maxContextTokens = AppContextLengthOption.fourK.tokens
+        model.setMaxContextTokens(AppContextLengthOption.fourK.tokens)
         let capacity = model.maximumImageAttachments
 
         var urls: [URL] = []
@@ -156,7 +219,7 @@ import TurboFieldfare
         defer { try? FileManager.default.removeItem(at: directory) }
         let model = AppModel(modelDirectory: directory,
                              client: MockLifecycleInferenceClient())
-        model.maxContextTokens = AppContextLengthOption.fourK.tokens
+        model.setMaxContextTokens(AppContextLengthOption.fourK.tokens)
         model.loadModel()
         let deadline = Date().addingTimeInterval(60)
         while !model.loadState.isReady, Date() < deadline {
@@ -167,7 +230,7 @@ import TurboFieldfare
 
         // Raising the setting without reloading must not raise what the
         // composer accepts, or it accepts images the request then refuses.
-        model.maxContextTokens = AppContextLengthOption.sixtyFourK.tokens
+        model.setMaxContextTokens(AppContextLengthOption.sixtyFourK.tokens)
         #expect(model.maximumImageAttachments == loadedCapacity,
                 "the composer offered capacity the loaded session cannot serve")
         #expect(model.effectiveMaxContextTokens
@@ -199,7 +262,7 @@ import TurboFieldfare
             else { unsetenv("TURBO_FIELDFARE_VISION_RUNTIME") }
         }
         model.addImages([source])
-        var deadline = Date().addingTimeInterval(60)
+        let deadline = Date().addingTimeInterval(60)
         while model.isAddingImages, Date() < deadline {
             try? await Task.sleep(nanoseconds: 5_000_000)
         }
@@ -216,11 +279,13 @@ import TurboFieldfare
         #expect(model.imageAttachments.count == 1,
                 "a refresh during a companion operation deleted staged images")
 
-        // Once the operation ends and support really is gone, they go: an
-        // attachment nothing can encode is worse than none.
+        // Once the operation ends and support really is gone, the draft still
+        // belongs to the user. Generate closes until the same companion is
+        // restored, but a transient external rename must not destroy input.
         model.visionInstallState = .idle
         model.refreshVisionInstallReadiness()
-        #expect(model.imageAttachments.isEmpty)
+        #expect(model.imageAttachments.count == 1)
+        #expect(!model.canRun)
         model.releaseAllAttachments()
     }
 }

@@ -92,35 +92,9 @@ import TurboFieldfare
             try request.validate()
         }
     }
-    @Test func duplicateAndMalformedImageDescriptorsAreRejected() {
-        let id = UUID()
-        let attachment = AppImageAttachment(
-            id: id,
-            fileURL: URL(fileURLWithPath: "/tmp/image.png"),
-            displayName: "image.png",
-            encodedBytes: 4,
-            sha256: String(repeating: "a", count: 64))
-        #expect(throws: AppInferenceError.self) {
-            try AppGenerationRequest(
-                modelDirectory: existingDirectory,
-                prompt: "",
-                imageAttachments: [attachment, attachment]).validate()
-        }
-        let malformed = AppImageAttachment(
-            fileURL: URL(fileURLWithPath: "/tmp/image.png"),
-            displayName: "image.png",
-            encodedBytes: 4,
-            sha256: "not-a-digest")
-        #expect(throws: AppInferenceError.self) {
-            try AppGenerationRequest(
-                modelDirectory: existingDirectory,
-                prompt: "",
-                imageAttachments: [malformed]).validate()
-        }
-    }
 
     @Test func imageOnlyRequestIsValid() throws {
-        let attachment = AppImageAttachment(
+        let attachment = StagedImage(
             fileURL: URL(fileURLWithPath: "/tmp/image.png"),
             displayName: "image.png",
             encodedBytes: 4,
@@ -132,16 +106,17 @@ import TurboFieldfare
         try request.validate()
     }
 
-    private func image(_ name: String) -> AppImageAttachment {
-        AppImageAttachment(
+    private func image(_ name: String) -> StagedImage {
+        StagedImage(
             fileURL: URL(fileURLWithPath: "/tmp/\(name)"),
             displayName: name, encodedBytes: 4,
             sha256: String(repeating: "a", count: 64))
     }
 
     @Test func imageCapacityShrinksAsTheConversationFills() throws {
+        // An empty conversation still keeps the reply's reserve free.
         let capacity = VisionImageTokenBudget.capacity(
-            maxContext: 8_192, reservedTextTokens: 0)
+            maxContext: 8_192, reservedTextTokens: ConversationGenerationReserve.tokens)
         #expect(capacity >= 2, "the fixture needs room for more than one image")
         let attachments = (0..<capacity).map { image("image-\($0).png") }
 
@@ -160,12 +135,23 @@ import TurboFieldfare
     }
 
     @Test func aTurnCarryingOneImageStillFitsLateInAConversation() throws {
-        let carried = 8_192 - VisionImageTokenBudget.maximumTokensPerImage - 16
+        // One image, the reply's reserve, and a little text still fit.
+        let carried = 8_192 - VisionImageTokenBudget.maximumTokensPerImage
+            - ConversationGenerationReserve.tokens - 16
         try AppGenerationRequest(
             modelDirectory: existingDirectory, prompt: "what is this",
             imageAttachments: [image("one.png")], maxContextTokens: 8_192,
             continuesConversation: true,
             conversationTokens: carried).validate()
+        // Without room for the reply, the same image is refused here rather
+        // than after the runtime has encoded it.
+        #expect(throws: AppInferenceError.self) {
+            try AppGenerationRequest(
+                modelDirectory: existingDirectory, prompt: "what is this",
+                imageAttachments: [image("one.png")], maxContextTokens: 8_192,
+                continuesConversation: true,
+                conversationTokens: carried + ConversationGenerationReserve.tokens).validate()
+        }
     }
 
     @Test func aOneShotRequestReservesNothingAndKeepsItsOldCapacity() throws {
@@ -200,6 +186,30 @@ import TurboFieldfare
         }
     }
 
+    /// The model's `max_position_embeddings`. A context above it is not a
+    /// memory question — no machine makes a position the model was never
+    /// trained to address valid — so it is refused here rather than surfacing
+    /// as a KV allocation the runtime throws on.
+    @Test func acontextAboveTheModelCeilingIsRejectedNamingBothNumbers() throws {
+        let ceiling = ArchConfig.gemma4_26B_A4B.maxPositionEmbeddings
+        #expect(ceiling == 262_144)
+
+        try AppGenerationRequest(
+            modelDirectory: existingDirectory, prompt: "hello",
+            maxContextTokens: ceiling).validate()
+
+        do {
+            try AppGenerationRequest(
+                modelDirectory: existingDirectory, prompt: "hello",
+                maxContextTokens: ceiling + 1).validate()
+            Issue.record("a context above the model ceiling was accepted")
+        } catch let error as AppInferenceError {
+            let message = "\(error)"
+            #expect(message.contains("262145"))
+            #expect(message.contains("262144"))
+        }
+    }
+
     @Test func invalidContextCannotOverflowImageCapacity() {
         let request = AppGenerationRequest(
             modelDirectory: existingDirectory,
@@ -217,4 +227,30 @@ import TurboFieldfare
             maxContext: Int.max, reservedTextTokens: Int.min) == 0)
     }
 
+    @Test func duplicateAndMalformedImageDescriptorsAreRejected() {
+        let id = UUID()
+        let attachment = StagedImage(
+            id: id,
+            fileURL: URL(fileURLWithPath: "/tmp/image.png"),
+            displayName: "image.png",
+            encodedBytes: 4,
+            sha256: String(repeating: "a", count: 64))
+        #expect(throws: AppInferenceError.self) {
+            try AppGenerationRequest(
+                modelDirectory: existingDirectory,
+                prompt: "",
+                imageAttachments: [attachment, attachment]).validate()
+        }
+        let malformed = StagedImage(
+            fileURL: URL(fileURLWithPath: "/tmp/image.png"),
+            displayName: "image.png",
+            encodedBytes: 4,
+            sha256: "not-a-digest")
+        #expect(throws: AppInferenceError.self) {
+            try AppGenerationRequest(
+                modelDirectory: existingDirectory,
+                prompt: "",
+                imageAttachments: [malformed]).validate()
+        }
+    }
 }

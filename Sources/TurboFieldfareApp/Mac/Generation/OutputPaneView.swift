@@ -6,7 +6,7 @@ import SwiftUI
 
 struct OutputPaneView: View {
     let model: AppModel
-    @State private var responseCopyFeedbackID: UUID?
+    @StoredState private var responseCopyFeedbackID: UUID?
 
     var body: some View {
         Group {
@@ -40,18 +40,24 @@ struct OutputPaneView: View {
 
     private var transcript: some View {
         IncrementalTranscriptView(
+            typography: ConversationTypography(model.textSize),
             history: model.transcriptHistory,
             contextBreak: model.transcriptContextBreak,
-            conversationEpoch: model.conversation.epoch,
+            conversationEpoch: model.displayedTranscriptID,
             lastAnswer: model.outputResponsePlainText,
             conversationPlainText: model.outputConversationPlainText,
-            requestNewChat: model.isRunning ? nil : { model.newChat() },
-            prompt: model.outputPromptText,
-            images: model.outputImageAttachments,
-            output: model.outputText,
-            mailbox: model.generationTranscriptMailbox,
-            isTerminal: !model.isRunning,
-            showsPrefillPlaceholder: model.isRunning
+            requestNewChat: model.isTurnInFlight ? nil : { model.newChat() },
+            // Blank while a stored copy is on screen. The live fields hold the
+            // chat the KV is still keeping, which is a different conversation
+            // from the one being read, and drawing it here would append one
+            // chat's newest exchange to another's transcript.
+            prompt: model.showsLiveTurn ? model.outputPromptText : "",
+            images: model.showsLiveTurn ? model.outputImageAttachments : [],
+            output: model.showsLiveTurn ? model.outputText : "",
+            mailbox: model.showsLiveTurn ? model.generationTranscriptMailbox : nil,
+            // Include replay, but not a queued send still displaying the old answer.
+            isTerminal: !model.isTranscriptTurnInFlight,
+            showsPrefillPlaceholder: model.isTranscriptTurnInFlight
                 && model.outputResponsePlainText.isEmpty,
             runIdentity: model.runIdentity)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -89,6 +95,7 @@ struct OutputPaneView: View {
                             ? "Copy last answer"
                             : "Response copied")
         .accessibilityHint("Copies only the generated answer")
+        .accessibilityIdentifier(.transcriptCopyResponse)
         .help(responseCopyFeedbackID == nil
               ? "Copy last answer"
               : "Response copied")
@@ -124,15 +131,16 @@ struct OutputPaneView: View {
                        action: model.loadModel)
                     .buttonStyle(.borderedProminent)
                     .controlSize(.large)
-            } else if isLoadingModel {
-                Button("Load Model", action: {})
+                    .accessibilityIdentifier(.transcriptLoad)
+            } else if model.canCancelLoad {
+                Button("Cancel Load", action: model.cancelLoad)
                     .buttonStyle(.borderedProminent)
                     .controlSize(.large)
-                    .hidden()
-                    .accessibilityHidden(true)
+                    .accessibilityIdentifier(.bannerModelAction)
             } else if model.canReloadModel {
                 Button("Reload Model", action: model.reloadModel)
                     .buttonStyle(.borderedProminent)
+                    .accessibilityIdentifier(.transcriptReload)
             }
         }
         .frame(maxWidth: .infinity)
@@ -171,12 +179,12 @@ struct OutputPaneView: View {
 }
 
 struct SubmittedImageThumbnail: View {
-    let attachment: AppImageAttachment
+    let attachment: ChatImage
     let maximumSize: CGSize
-    @State private var image: NSImage?
+    @StoredState private var image: NSImage?
 
     init(
-        attachment: AppImageAttachment,
+        attachment: ChatImage,
         maximumSize: CGSize = CGSize(width: 48, height: 48)
     ) {
         self.attachment = attachment
@@ -272,46 +280,9 @@ private struct EmptyPlaceholderIcon: View {
     }
 }
 
-private struct EmptyConversationLayout: Layout {
-    let spacing: CGFloat
-
-    func sizeThatFits(
-        proposal: ProposedViewSize,
-        subviews: Subviews,
-        cache: inout ()
-    ) -> CGSize {
-        proposal.replacingUnspecifiedDimensions()
-    }
-
-    func placeSubviews(
-        in bounds: CGRect,
-        proposal: ProposedViewSize,
-        subviews: Subviews,
-        cache: inout ()
-    ) {
-        guard subviews.count == 2 else { return }
-
-        let iconSize = subviews[0].sizeThatFits(.unspecified)
-        let iconCenter = CGPoint(x: bounds.midX, y: bounds.midY)
-        subviews[0].place(
-            at: iconCenter,
-            anchor: .center,
-            proposal: ProposedViewSize(
-                width: iconSize.width,
-                height: iconSize.height))
-
-        subviews[1].place(
-            at: CGPoint(
-                x: bounds.midX,
-                y: iconCenter.y + iconSize.height / 2 + spacing),
-            anchor: .top,
-            proposal: ProposedViewSize(width: bounds.width, height: nil))
-    }
-}
-
 private struct LoadingModelText: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @State private var animationStart = Date()
+    @StoredState private var animationStart = Date()
 
     var body: some View {
         if reduceMotion {
@@ -335,6 +306,7 @@ private struct LoadingModelText: View {
 }
 
 private struct IncrementalTranscriptView: NSViewRepresentable {
+    var typography = ConversationTypography()
     var history: [(user: AppChatTurn, assistant: AppChatTurn)] = []
     /// Pairs above this index are on screen but no longer in the model's
     /// context. Nil when everything drawn is still in the KV.
@@ -344,7 +316,7 @@ private struct IncrementalTranscriptView: NSViewRepresentable {
     var conversationPlainText: String = ""
     var requestNewChat: (() -> Void)?
     var prompt: String
-    var images: [AppImageAttachment] = []
+    var images: [ChatImage] = []
     var output: String
     var mailbox: GenerationTranscriptMailbox?
     var isTerminal: Bool
@@ -402,6 +374,9 @@ private struct IncrementalTranscriptView: NSViewRepresentable {
         func attach(scrollView: NSScrollView, textView: NSTextView) {
             self.scrollView = scrollView
             self.textView = textView
+            (scrollView as? TranscriptScrollView)?.didRestoreReadingPosition = { [weak self] in
+                self?.recordScrollPosition()
+            }
             // Right-click inside a turn offers that turn's answer, so a
             // transcript of several turns has an unambiguous copy affordance
             // rather than one floating button that reads as the first turn's.
@@ -434,6 +409,7 @@ private struct IncrementalTranscriptView: NSViewRepresentable {
         }
 
         func synchronize(
+            typography: ConversationTypography,
             history: [(user: AppChatTurn, assistant: AppChatTurn)],
             contextBreak: Int?,
             conversationEpoch: UUID,
@@ -441,7 +417,7 @@ private struct IncrementalTranscriptView: NSViewRepresentable {
             conversationPlainText: String,
             requestNewChat: (() -> Void)?,
             prompt: String,
-            images: [AppImageAttachment],
+            images: [ChatImage],
             output: String,
             mailbox: GenerationTranscriptMailbox?,
             isTerminal: Bool,
@@ -485,6 +461,8 @@ private struct IncrementalTranscriptView: NSViewRepresentable {
             // view that is already at the bottom.
             if !response.isEmpty || isTerminal { follow.end() }
             if startedNewRun || shouldFollowNow() { scrollToBottom() }
+            refreshTypography(typography, history: history, contextBreak: contextBreak,
+                              epoch: conversationEpoch)
         }
 
         /// Keeps the drawn document in step with the conversation.
@@ -506,60 +484,62 @@ private struct IncrementalTranscriptView: NSViewRepresentable {
             firstSynchronize: Bool
         ) {
             guard let textView, let storage = textView.textStorage else { return }
-            let steps = planner.plan(TranscriptSyncPlanner.Input(
-                epoch: epoch, historyCount: history.count, contextBreak: contextBreak,
-                startedNewRun: startedNewRun, firstSynchronize: firstSynchronize))
-            guard !steps.isEmpty else { return }
-
-            storage.beginEditing()
+            let controller = documentController
+            let steps = controller.synchronizeHistory(
+                storage: storage, planner: &planner,
+                input: TranscriptSyncPlanner.Input(
+                    epoch: epoch, historyCount: history.count, contextBreak: contextBreak,
+                    startedNewRun: startedNewRun, firstSynchronize: firstSynchronize)
+            ) { index in
+                drawHistoryPair(history[index], storage: storage)
+            }
             for step in steps {
                 switch step {
                 case .reset:
-                    documentController.resetTranscript(storage: storage)
-                    promptPrefixIdentifier = ""
                     promptPrefix = NSAttributedString()
+                    promptPrefixIdentifier = ""
                     prompt = ""
-                case .sealDrawnTurn:
-                    let before = documentController.frozenLength
-                    documentController.sealTurn(storage: storage)
-                    if documentController.frozenLength == before {
-                        // It froze nothing, so the pair is still owed; consuming
-                        // it would drop a turn that is in the KV from the
-                        // transcript for good.
-                        planner.sealFoundNothingToFreeze(historyCount: history.count)
-                    }
-                case .drawPair(let index):
-                    guard index < history.count else { break }
-                    let pair = history[index]
-                    _ = documentController.synchronize(
-                        storage: storage,
-                        prompt: pair.user.text,
-                        response: pair.assistant.text,
-                        isTerminal: true,
-                        // Cached thumbnails only. A history image whose
-                        // thumbnail has not been decoded yet is dropped rather
-                        // than blocking the redraw; the same degradation the
-                        // live path already accepts.
-                        promptPrefix: Self.makePromptPrefix(pair.user.images),
-                        promptPrefixIdentifier: pair.user.images
-                            .map { "\($0.id.uuidString):\($0.sha256)" }
-                            .joined(separator: ","))
-                    documentController.sealTurn(storage: storage)
+                case .drawPair:
                     prompt = ""
                     promptPrefixIdentifier = ""
-                case .appendContextBreak:
-                    let before = documentController.frozenLength
-                    documentController.appendContextBreak(
-                        storage: storage,
-                        text: "Earlier turns are no longer in the model's context")
-                    // Only marked when it actually wrote. Latching it on a
-                    // refusal suppressed the break for the rest of the session.
-                    if documentController.frozenLength != before {
-                        planner.markContextBreakDrawn()
-                    }
+                case .sealDrawnTurn, .appendContextBreak:
+                    break
                 }
             }
-            storage.endEditing()
+        }
+
+        private func refreshTypography(
+            _ typography: ConversationTypography,
+            history: [(user: AppChatTurn, assistant: AppChatTurn)],
+            contextBreak: Int?, epoch: UUID
+        ) {
+            guard documentController.typography != typography,
+                  let textView, let scrollView, let storage = textView.textStorage else { return }
+            let position = TranscriptReadingPosition(
+                textView: textView, scrollView: scrollView, followsPrefill: shouldFollowNow())
+            let update = documentController.refreshTypography(
+                typography, storage: storage, planner: &planner,
+                input: .init(epoch: epoch, historyCount: history.count,
+                             contextBreak: contextBreak, startedNewRun: false,
+                             firstSynchronize: true),
+                promptPrefix: promptPrefix
+            ) { index in
+                drawHistoryPair(history[index], storage: storage)
+            }
+            position.restore(textView: textView, scrollView: scrollView,
+                             replacing: update.replaced)
+            recordScrollPosition()
+        }
+
+        private func drawHistoryPair(
+            _ pair: (user: AppChatTurn, assistant: AppChatTurn), storage: NSMutableAttributedString
+        ) {
+            documentController.synchronize(
+                storage: storage, prompt: pair.user.text, response: pair.assistant.text,
+                isTerminal: true, promptPrefix: Self.makePromptPrefix(pair.user.images),
+                promptPrefixIdentifier: pair.user.images.map {
+                    "\($0.id.uuidString):\($0.sha256)"
+                }.joined(separator: ","))
         }
 
         func scrollToBottom() {
@@ -741,7 +721,7 @@ private struct IncrementalTranscriptView: NSViewRepresentable {
         /// stopped wanting is dropped rather than applied. Images arriving after
         /// the first paint is the case `follow` already exists for.
         private func buildPromptPrefix(
-            _ images: [AppImageAttachment], identifier: String
+            _ images: [ChatImage], identifier: String
         ) {
             guard !images.isEmpty else { return }
             Task { [weak self] in
@@ -767,23 +747,22 @@ private struct IncrementalTranscriptView: NSViewRepresentable {
         }
 
         private static func makePromptPrefix(
-            _ images: [AppImageAttachment]
+            _ images: [ChatImage]
         ) -> NSAttributedString {
+            let cells = TranscriptImageCells.images(
+                for: images,
+                load: { attachment in
+                    guard let image = SubmittedImageThumbnail.loadThumbnail(
+                        at: attachment.fileURL,
+                        maximumPixelSize: 720,
+                        cacheKey: attachment.sha256) else { return nil }
+                    image.size = SubmittedImageThumbnail.fittedSize(
+                        image.size, within: CGSize(width: 360, height: 240))
+                    return image
+                },
+                unreadable: Self.unreadableImageTile)
             let result = NSMutableAttributedString()
-            for attachment in images {
-                // A refused or unreadable image is dropped from the transcript,
-                // which is the same degradation the composer's placeholder tile
-                // gives. The separator therefore keys off what has actually
-                // been written, not off the attachment's index: keyed off the
-                // index, a first image the decode budget refused left the line
-                // starting with a bare gap.
-                guard let image = SubmittedImageThumbnail.loadThumbnail(
-                    at: attachment.fileURL,
-                    maximumPixelSize: 720,
-                    cacheKey: attachment.sha256) else { continue }
-                image.size = SubmittedImageThumbnail.fittedSize(
-                    image.size,
-                    within: CGSize(width: 360, height: 240))
+            for image in cells {
                 let textAttachment = NSTextAttachment()
                 textAttachment.attachmentCell = NSTextAttachmentCell(
                     imageCell: Self.rounded(image))
@@ -798,6 +777,39 @@ private struct IncrementalTranscriptView: NSViewRepresentable {
         /// The transcript draws its images as text attachments, which cannot be
         /// clipped by the view the way the composer's thumbnails are, so the
         /// corners have to be drawn into the image itself.
+        /// Stands in for an image whose file is gone or will not decode.
+        ///
+        /// The same shape and the same symbol the composer already falls back
+        /// to, so the two degrade alike. Its job is only to say a picture
+        /// belongs here: what it was is in the answer, and why it cannot be
+        /// read is not something the reader can act on from the transcript.
+        private static func unreadableImageTile() -> NSImage {
+            let size = NSSize(width: 160, height: 120)
+            let tile = NSImage(size: size)
+            tile.lockFocus()
+            defer { tile.unlockFocus() }
+            NSColor.quaternarySystemFill.setFill()
+            NSRect(origin: .zero, size: size).fill()
+            let configuration = NSImage.SymbolConfiguration(
+                pointSize: 28, weight: .regular)
+            if let symbol = NSImage(
+                systemSymbolName: "photo", accessibilityDescription: nil)?
+                .withSymbolConfiguration(configuration) {
+                let tinted = NSImage(size: symbol.size)
+                tinted.lockFocus()
+                NSColor.tertiaryLabelColor.set()
+                NSRect(origin: .zero, size: symbol.size).fill(using: .sourceOver)
+                symbol.draw(in: NSRect(origin: .zero, size: symbol.size),
+                            from: .zero, operation: .destinationIn, fraction: 1)
+                tinted.unlockFocus()
+                tinted.draw(in: NSRect(
+                    x: (size.width - symbol.size.width) / 2,
+                    y: (size.height - symbol.size.height) / 2,
+                    width: symbol.size.width, height: symbol.size.height))
+            }
+            return tile
+        }
+
         private static func rounded(_ image: NSImage) -> NSImage {
             let size = image.size
             guard size.width > 1, size.height > 1 else { return image }
@@ -821,7 +833,7 @@ private struct IncrementalTranscriptView: NSViewRepresentable {
     func makeCoordinator() -> Coordinator { Coordinator() }
 
     func makeNSView(context: Context) -> NSScrollView {
-        let scrollView = NSScrollView()
+        let scrollView = TranscriptScrollView()
         scrollView.hasVerticalScroller = true
         scrollView.autohidesScrollers = true
         scrollView.drawsBackground = false
@@ -848,6 +860,7 @@ private struct IncrementalTranscriptView: NSViewRepresentable {
         guard let textView = scrollView.documentView as? NSTextView else { return }
         context.coordinator.attach(scrollView: scrollView, textView: textView)
         context.coordinator.synchronize(
+            typography: typography,
             history: history,
             contextBreak: contextBreak,
             conversationEpoch: conversationEpoch,
@@ -887,47 +900,65 @@ private struct TranscriptPreview: View {
     }
 }
 
-#Preview("Empty") {
-    VStack(spacing: 8) {
-        Image(systemName: "cube.transparent")
-            .font(.title2)
-            .foregroundStyle(.quaternary)
-        Text("Start a chat, or choose a predefined example.")
-            .font(.headline)
-        Text("Each message keeps the ones before it in context.")
-            .foregroundStyle(.secondary)
+private struct EmptyOutputPreview: PreviewProvider {
+    static var previews: some View {
+        VStack(spacing: 8) {
+            Image(systemName: "cube.transparent")
+                .font(.title2)
+                .foregroundStyle(.quaternary)
+            Text("Start a chat, or choose a predefined example.")
+                .font(.headline)
+            Text("Each message keeps the ones before it in context.")
+                .foregroundStyle(.secondary)
+        }
+        .frame(width: 720, height: 420)
+        .previewDisplayName("Empty")
     }
-    .frame(width: 720, height: 420)
 }
 
-#Preview("Streaming") {
-    TranscriptPreview(
-        response: "A response arriving one readable piece at a time...",
-        isTerminal: false)
+private struct StreamingOutputPreview: PreviewProvider {
+    static var previews: some View {
+        TranscriptPreview(
+            response: "A response arriving one readable piece at a time...",
+            isTerminal: false)
+            .previewDisplayName("Streaming")
+    }
 }
 
-#Preview("Prefilling") {
-    TranscriptPreview(
-        response: "",
-        isTerminal: false,
-        showsPrefillPlaceholder: true)
+private struct PrefillingOutputPreview: PreviewProvider {
+    static var previews: some View {
+        TranscriptPreview(
+            response: "",
+            isTerminal: false,
+            showsPrefillPlaceholder: true)
+            .previewDisplayName("Prefilling")
+    }
 }
 
-#Preview("Completed prose") {
-    TranscriptPreview(
-        response: "# A clear answer\n\nHere is a concise explanation with **useful emphasis**.\n\n- First point\n- Second point",
-        isTerminal: true)
+private struct CompletedProseOutputPreview: PreviewProvider {
+    static var previews: some View {
+        TranscriptPreview(
+            response: "# A clear answer\n\nHere is a concise explanation with **useful emphasis**.\n\n- First point\n- Second point",
+            isTerminal: true)
+            .previewDisplayName("Completed prose")
+    }
 }
 
-#Preview("Completed code") {
-    TranscriptPreview(
-        response: "Use `fibonacci(7)`:\n\n```python\ndef fibonacci(n: int) -> list[int]:\n    return []\n```",
-        isTerminal: true)
+private struct CompletedCodeOutputPreview: PreviewProvider {
+    static var previews: some View {
+        TranscriptPreview(
+            response: "Use `fibonacci(7)`:\n\n```python\ndef fibonacci(n: int) -> list[int]:\n    return []\n```",
+            isTerminal: true)
+            .previewDisplayName("Completed code")
+    }
 }
 
-#Preview("Incomplete Markdown fallback") {
-    TranscriptPreview(
-        response: "The partial answer remains readable.\n\n```python\nprint('unfinished')",
-        isTerminal: true)
+private struct IncompleteMarkdownFallbackOutputPreview: PreviewProvider {
+    static var previews: some View {
+        TranscriptPreview(
+            response: "The partial answer remains readable.\n\n```python\nprint('unfinished')",
+            isTerminal: true)
+            .previewDisplayName("Incomplete Markdown fallback")
+    }
 }
 #endif

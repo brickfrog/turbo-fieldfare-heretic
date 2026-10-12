@@ -2,7 +2,91 @@ import Foundation
 import Testing
 @testable import TurboFieldfareAppCore
 
+@Suite struct AppInferenceErrorDiagnosticTests {
+    /// What crosses a process boundary is the cause, not the sentence. The
+    /// decode service forwarded `"\(error)"` — which is the sentence — and the
+    /// client wrapped it again, so a failed replay read "This conversation
+    /// could not be reopened: This conversation could not be reopened: image
+    /// support is unavailable: …". Found running case E46 with the vision pack
+    /// moved aside.
+    @Test func adiagnosticMessageCarriesTheCauseWithoutTheSentence() {
+        let error = AppInferenceError.conversationRestoreFailed(
+            "image support is unavailable")
+        #expect(error.userMessage
+            == "This conversation could not be reopened: image support is unavailable")
+        #expect(error.diagnosticMessage == "image support is unavailable")
+        // Re-wrapping the diagnostic says it once; re-wrapping the sentence
+        // said it twice.
+        let rewrapped = AppInferenceError.conversationRestoreFailed(
+            error.diagnosticMessage)
+        #expect(rewrapped.userMessage == error.userMessage)
+    }
+
+    /// A case with no message of its own falls back to its own wording rather
+    /// than to an empty string.
+    @Test func acaseWithoutAMessageStillReportsSomething() {
+        #expect(!AppInferenceError.modelNotLoaded.diagnosticMessage.isEmpty)
+        #expect(AppInferenceError.modelNotLoaded.diagnosticMessage
+            == AppInferenceError.modelNotLoaded.userMessage)
+    }
+}
+
 @Suite struct AppModelTests {
+
+    @MainActor @Test func cacheSelectionClampsContextAndPersistsBothSettings() throws {
+        let root = try makeSettingsRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let directory = root.appendingPathComponent("model.gturbo")
+        let model = AppModel(modelDirectory: directory, client: MockLifecycleInferenceClient(),
+                             settingsPersistenceEnabled: true, hostMemoryBytes: 8 << 30)
+        model.setMaxContextTokens(131_072)
+        model.setExpertCacheSlots(24)
+        #expect(model.maxContextTokens == 65_536)
+        #expect(model.contextClampNotice?.contains("131,072") == true)
+        #expect(!model.contextOptions.contains(.oneTwentyEightK))
+        let saved = MacAppSettingsFileStore.loadOrCreate(forModelDirectory: directory)
+        #expect(saved.contextTokens == 65_536)
+        #expect(saved.expertCacheSlots == 24)
+        model.setExpertCacheSlots(16)
+        #expect(model.contextOptions.contains(.oneTwentyEightK))
+        #expect(model.maxContextTokens == 65_536)
+    }
+
+    @MainActor @Test func storedCacheGrowthClampsOnLaunchAndModelChange() throws {
+        let root = try makeSettingsRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let first = root.appendingPathComponent("first/model.gturbo")
+        let second = root.appendingPathComponent("second/model.gturbo")
+        for directory in [first, second] {
+            try MacAppSettingsFileStore.save(MacAppSettings(contextTokens: 131_072,
+                                                            expertCacheSlots: 24),
+                                             forModelDirectory: directory)
+        }
+        let model = AppModel(modelDirectory: first, client: MockLifecycleInferenceClient(),
+                             settingsPersistenceEnabled: true, hostMemoryBytes: 8 << 30)
+        #expect(model.maxContextTokens == 65_536)
+        #expect(model.contextClampNotice != nil)
+        model.setModelURL(second)
+        #expect(model.maxContextTokens == 65_536)
+        #expect(model.contextClampNotice != nil)
+    }
+
+    @MainActor @Test func loadRefusesCacheGrowthThatBypassedThePicker() throws {
+        let directory = try makeCompleteModelInstall("cache-context-refusal")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let client = MockLifecycleInferenceClient()
+        let model = AppModel(modelDirectory: directory, client: client, hostMemoryBytes: 8 << 30)
+        model.setMaxContextTokens(131_072)
+        model.runtimeOptions.expertCacheSlots = 32
+        model.loadModel()
+        guard case .failed(let error) = model.loadState else {
+            Issue.record("unbacked cache/context combination reached loading")
+            return
+        }
+        #expect("\(error)".contains("16 GB"))
+        #expect(client.ensureLoadedCallCount() == 0)
+    }
+
     @MainActor
     @Test func defaultsUseSampledRequest() throws {
         let model = AppModel()
@@ -95,9 +179,8 @@ import Testing
         model.applyLoadState(.ready(modelDirectory: directory, loadSeconds: 0))
 
         #expect(!model.hasStaleLoadedRuntime)
-        // Away from the default, which is 8K: setting the value it already has
-        // would prove nothing.
-        model.maxContextTokens = AppContextLengthOption.sixteenK.tokens
+        // 8K is the default now, so changing to it changes nothing.
+        model.setMaxContextTokens(AppContextLengthOption.sixteenK.tokens)
         #expect(model.hasStaleLoadedRuntime)
     }
 
@@ -106,7 +189,7 @@ import Testing
         let model = AppModel()
         model.modelPathText = FileManager.default.temporaryDirectory.path
         model.promptText = "go"
-        model.maxContextTokens = AppContextLengthOption.sixtyFourK.tokens
+        model.setMaxContextTokens(AppContextLengthOption.sixtyFourK.tokens)
 
         #expect(try model.makeRequest().maxNewTokens == AppContextLengthOption.sixtyFourK.tokens)
     }
@@ -163,7 +246,7 @@ import Testing
 
         model.setShowPromptExamples(true)
         model.promptText = "first turn"
-        model.run()
+        model.send()
         await waitForIdle(model)
 
         #expect(model.promptText.isEmpty)
@@ -183,11 +266,9 @@ import Testing
         model.loadState = .ready(modelDirectory: FileManager.default.temporaryDirectory, loadSeconds: 1)
         model.promptText = "go"
         model.maxNewTokensOverride = 4
-        model.run()
+        model.send()
 
-        for _ in 0..<200 where model.isRunning {
-            try? await Task.sleep(nanoseconds: 5_000_000)
-        }
+        await SendWaiting.turnEnds(model)
 
         #expect(!model.isRunning)
         #expect(model.outputText.contains("alpha beta"))
@@ -201,10 +282,14 @@ import Testing
         let model = readyModel(client: client)
         model.promptText = "original prompt"
         model.maxNewTokensOverride = 1
-        model.run()
+        model.send()
+        // The composer clears on the click; the transcript picks the message up
+        // one stage later, when the request has been built and its images
+        // retained.
+        #expect(model.promptText.isEmpty)
+        await SendWaiting.generationStarts(model)
 
         #expect(model.outputPromptText == "original prompt")
-        #expect(model.promptText.isEmpty)
         #expect(model.hasOutputTranscript)
         #expect(model.outputResponsePlainText.isEmpty)
         #expect(model.outputConversationPlainText == "You:\noriginal prompt")
@@ -228,7 +313,8 @@ import Testing
         model.promptText = "original prompt"
         model.maxNewTokensOverride = 1
 
-        model.run()
+        model.send()
+        await SendWaiting.generationStarts(model)
 
         #expect(model.isRunning)
         #expect(model.outputPromptText == "original prompt")
@@ -243,12 +329,15 @@ import Testing
     }
 
     @MainActor
-    @Test func failedValidationDoesNotClearPrompt() {
+    @Test func failedValidationDoesNotClearPrompt() async {
         let model = readyModel(client: MockInferenceClient(response: "answer"))
         model.promptText = "keep invalid prompt"
         model.maxNewTokensOverride = 0
 
-        model.run()
+        model.send()
+        // The composer is handed over before the request is built, so the
+        // message comes back a hop later rather than never having left.
+        await SendWaiting.turnEnds(model)
 
         #expect(!model.isRunning)
         #expect(model.promptText == "keep invalid prompt")
@@ -280,7 +369,7 @@ import Testing
         let model = readyModel(client: client)
         model.promptText = "stop after token"
         model.maxNewTokensOverride = 10
-        model.run()
+        model.send()
 
         for _ in 0..<200 where model.liveTokenCount == 0 {
             try? await Task.sleep(nanoseconds: 5_000_000)
@@ -314,7 +403,7 @@ import Testing
         client.prefillSteps = 20
         let model = readyModel(client: client)
         model.promptText = "prefill prompt"
-        model.run()
+        model.send()
 
         for _ in 0..<200 where model.livePrefillDone == 0 {
             try? await Task.sleep(nanoseconds: 5_000_000)
@@ -341,7 +430,7 @@ import Testing
         let model = readyModel(client: client)
         model.promptText = "fail"
 
-        model.run()
+        model.send()
         await waitForIdle(model)
 
         #expect(model.error?.userMessage == "synthetic failure")
@@ -379,6 +468,135 @@ import Testing
         #expect(!model.canRun)
     }
 
+    /// A settings file can carry a context this Mac cannot back — written on a
+    /// larger machine, or on a build whose admission rule was looser. Opening
+    /// the app on it would put every load into `.failed` with no way back
+    /// except a menu the user has to guess at, so it is clamped and said.
+    @MainActor
+    @Test func unavailableStoredContextIsClampedWithNotice() throws {
+        let root = try makeSettingsRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let modelDirectory = root.appendingPathComponent("gemma4.gturbo", isDirectory: true)
+        try MacAppSettingsFileStore.save(MacAppSettings(contextTokens: 262_144),
+                                         forModelDirectory: modelDirectory)
+
+        let model = AppModel(modelDirectory: modelDirectory,
+                             client: MockLifecycleInferenceClient(),
+                             settingsPersistenceEnabled: true,
+                             hostMemoryBytes: 8_589_934_592)
+
+        #expect(model.maxContextTokens == 131_072)
+        let notice = try #require(model.contextClampNotice,
+                                  "the context was changed without saying so")
+        #expect(notice.contains("262,144"))
+        #expect(notice.contains("16 GB"))
+        #expect(notice.contains("128K"))
+
+        model.setMaxContextTokens(model.maxContextTokens)
+        #expect(model.contextClampNotice == notice)
+
+        // Context edits must go through the history-aware setter after the merge;
+        // direct assignment clears the notice but loses persistence and redraw.
+        model.setMaxContextTokens(65_536)
+        #expect(model.contextClampNotice == nil)
+        #expect(MacAppSettingsFileStore.loadOrCreate(
+            forModelDirectory: modelDirectory).contextTokens == 65_536)
+    }
+
+    /// The same clamp on the settings-apply path, which `init` does not cover:
+    /// switching model directories adopts that directory's settings, and one
+    /// of them can carry a context this Mac cannot back. The notice also has
+    /// to survive being set — assigning the context clears it, so an
+    /// assignment made after the notice would wipe it.
+    @MainActor
+    @Test func achangedModelDirectoryClampsItsStoredContextToo() throws {
+        let root = try makeSettingsRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let first = root.appendingPathComponent("first/model.gturbo", isDirectory: true)
+        let second = root.appendingPathComponent("second/model.gturbo", isDirectory: true)
+        try MacAppSettingsFileStore.save(MacAppSettings(contextTokens: 8_192),
+                                         forModelDirectory: first)
+        try MacAppSettingsFileStore.save(MacAppSettings(contextTokens: 262_144),
+                                         forModelDirectory: second)
+        let model = AppModel(modelDirectory: first,
+                             client: MockLifecycleInferenceClient(),
+                             settingsPersistenceEnabled: true,
+                             hostMemoryBytes: 8_589_934_592)
+        try #require(model.contextClampNotice == nil)
+
+        model.setModelURL(second)
+
+        #expect(model.maxContextTokens == 131_072)
+        #expect(model.contextClampNotice?.contains("262,144") == true,
+                "the clamp on the settings-apply path said nothing")
+    }
+
+    @MainActor
+    @Test func availableStoredContextIsKept() throws {
+        let root = try makeSettingsRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let modelDirectory = root.appendingPathComponent("gemma4.gturbo", isDirectory: true)
+        try MacAppSettingsFileStore.save(MacAppSettings(contextTokens: 262_144),
+                                         forModelDirectory: modelDirectory)
+
+        let model = AppModel(modelDirectory: modelDirectory,
+                             client: MockLifecycleInferenceClient(),
+                             settingsPersistenceEnabled: true,
+                             hostMemoryBytes: 25_769_803_776)
+
+        #expect(model.maxContextTokens == 262_144)
+        #expect(model.contextClampNotice == nil)
+    }
+
+    /// The refusal has to happen before the load state moves, or the app sends
+    /// the decode service a context that gets the service killed part-way
+    /// through — which reaches the user as a lost connection, not as a reason.
+    @MainActor
+    @Test func loadRefusesUnavailableContextBeforeLoading() async throws {
+        let directory = try makeCompleteModelInstall("context-refusal")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let client = MockLifecycleInferenceClient()
+        let model = AppModel(modelDirectory: directory,
+                             client: client,
+                             hostMemoryBytes: 8_589_934_592)
+        model.setMaxContextTokens(262_144)
+        try #require(model.canLoadModel)
+
+        model.loadModel()
+
+        guard case .failed(let error) = model.loadState else {
+            Issue.record("an unbacked context was allowed to start loading")
+            return
+        }
+        #expect("\(error)".contains("262,144"))
+        #expect(client.ensureLoadedCallCount() == 0,
+                "the loader was reached with a context this host cannot back")
+        #expect(!model.loadState.isLoading)
+    }
+
+    @Test func contextOptionsNoteNamesHiddenSizes() throws {
+        let note = try #require(
+            AppModel.contextOptionsNote(hostMemoryBytes: 8_589_934_592))
+        #expect(note.contains("262,144"))
+        #expect(note.contains("16 GB"))
+        #expect(note.contains("8 GB"))
+        // 128K is offered on this host, so it is not something to explain away.
+        #expect(!note.contains("131,072"))
+    }
+
+    @Test func contextOptionsNoteIsAbsentWhenEverySizeIsOffered() {
+        #expect(AppModel.contextOptionsNote(hostMemoryBytes: 25_769_803_776) == nil)
+    }
+
+    private func makeSettingsRoot() throws -> URL {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("AppModelContext-\(UUID().uuidString)",
+                                    isDirectory: true)
+        try FileManager.default.createDirectory(at: root,
+                                                withIntermediateDirectories: true)
+        return root
+    }
+
     @MainActor
     private func readyModel(client: MockInferenceClient) -> AppModel {
         let model = AppModel(client: client)
@@ -389,8 +607,6 @@ import Testing
 
     @MainActor
     private func waitForIdle(_ model: AppModel) async {
-        for _ in 0..<200 where model.isRunning {
-            try? await Task.sleep(nanoseconds: 5_000_000)
-        }
+        await SendWaiting.turnEnds(model)
     }
 }

@@ -4,7 +4,10 @@ import TurboFieldfare
 public struct AppGenerationRequest: Equatable, Sendable {
     public var modelDirectory: URL
     public var prompt: String
-    public var imageAttachments: [AppImageAttachment]
+    /// Staged files only. A request carries what this session may open and,
+    /// on the service path, what it may hand to another process; a stored
+    /// conversation's pictures reach the runtime as replay images instead.
+    public var imageAttachments: [StagedImage]
     public var maxNewTokens: Int
     public var maxContextTokens: Int
     public var temperature: Float
@@ -31,7 +34,7 @@ public struct AppGenerationRequest: Equatable, Sendable {
 
     public init(modelDirectory: URL,
                 prompt: String,
-                imageAttachments: [AppImageAttachment] = [],
+                imageAttachments: [StagedImage] = [],
                 maxNewTokens: Int = 4_096,
                 maxContextTokens: Int = 4096,
                 temperature: Float = 0.2,
@@ -77,6 +80,16 @@ public struct AppGenerationRequest: Equatable, Sendable {
         guard maxContextTokens > 0 else {
             throw AppInferenceError.invalidRequest("Max context must be greater than zero.")
         }
+        // The checkpoint's `max_position_embeddings`. Above it the model is
+        // being asked for a position it was never trained to address, which no
+        // amount of memory makes valid, so this is refused here rather than
+        // discovered as a KV allocation the runtime then throws on.
+        let modelCeiling = ArchConfig.gemma4_26B_A4B.maxPositionEmbeddings
+        guard maxContextTokens <= modelCeiling else {
+            throw AppInferenceError.invalidRequest(
+                "Max context \(maxContextTokens) is above the model's "
+                    + "\(modelCeiling)-token limit.")
+        }
         guard conversationTokens >= 0, conversationTokens <= maxContextTokens else {
             throw AppInferenceError.invalidRequest(
                 "Conversation tokens must be between zero and the max context.")
@@ -85,8 +98,12 @@ public struct AppGenerationRequest: Equatable, Sendable {
         // around. Reserving zero here admitted an image that fits an empty
         // context into a context that was almost full, and the turn then failed
         // deep in prefill instead of at the composer.
+        // Plus the reply's reserve, which `generate` checks after every image
+        // has been encoded; admitting a set that fits the context but not the
+        // reserve failed the turn on the runtime instead of here.
         let capacity = VisionImageTokenBudget.capacity(
-            maxContext: maxContextTokens, reservedTextTokens: conversationTokens)
+            maxContext: maxContextTokens,
+            reservedTextTokens: conversationTokens + ConversationGenerationReserve.tokens)
         guard imageAttachments.count <= capacity else {
             throw AppInferenceError.invalidRequest(
                 "\(imageAttachments.count) images need up to "

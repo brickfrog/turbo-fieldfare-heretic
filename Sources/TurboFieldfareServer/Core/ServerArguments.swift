@@ -17,6 +17,11 @@ public struct ServerArguments: Equatable, Sendable {
     public let visionPack: String?
     public let visionResidency: VisionResidencyPolicy
 
+    public static let allowedMaxContext = [
+        4_096, 8_192, 16_384, 32_768, 65_536, 98_304, 131_072, 196_608, 262_144,
+    ]
+    public static let unbackedContextOverrideVariable = "TURBO_FIELDFARE_ALLOW_UNBACKED_CONTEXT"
+
     public static let usage = """
     usage: TurboFieldfareServer --model <completed .gturbo directory> [options]
 
@@ -27,17 +32,26 @@ public struct ServerArguments: Equatable, Sendable {
       --host <address>           Bind address (default 127.0.0.1).
       --port <1...65535>         Listen port (default 8080).
       --model-id <id>            API model identifier (default gemma-4-26b-a4b-it).
-      --max-context <tokens>     4096, 8192, 16384, 32768, or 65536 (default 16384).
+      --max-context <tokens>     4096, 8192, 16384, 32768, 65536, 98304,
+                                 131072, 196608, or 262144 (default 16384).
+                                 Contexts exceeding the host memory budget are refused.
+                                 TURBO_FIELDFARE_ALLOW_UNBACKED_CONTEXT=1 overrides this.
       --queue-limit <count>      Maximum queued requests (default 4).
       --prompt-cache-mode <off|single-prefix>
                                  Prompt KV reuse mode (default single-prefix).
-      --expert-cache-slots <n>   Expert-cache slots: 8, 16, 24, or 32 (default 16).
+      --expert-cache-slots <n>   Expert-cache slots: \(RuntimeConfiguration.allowedValueList(RuntimeConfiguration.allowedExpertCacheSlots)) (default 16).
       --expert-cache-policy <s>  Expert-cache policy: lfu or lru (default lfu).
       --prefill on|off           Enable or disable chunked prompt prefill (default on).
                                  Chunked prefill requires 16 or more cache slots.
-      --prefill-chunk-tokens <n> Prefill chunk size: 32, 64, 128, or 256
+      --prefill-chunk-tokens <n|auto>
+                                 Prefill chunk size: \(RuntimeConfiguration.allowedValueList(RuntimeConfiguration.allowedPrefillChunkTokens, alsoAccepting: ["auto"]))
                                  (default 128). Each chunk re-reads the routed
-                                 expert pool, so larger chunks read less.
+                                 expert pool, so larger chunks read less; auto
+                                 runs at the cap, 256, which prefills every
+                                 prompt in the same spans a per-request size
+                                 would. Prefill scratch is sized from the chunk,
+                                 so the cap holds about 32.5 MB of it against
+                                 16.4 MB at 128.
       --rdadvise <s>             Read-advice policy: off, default, bounded, or adaptive
                                  (default off).
       --help                     Show this help.
@@ -51,13 +65,15 @@ public struct ServerArguments: Equatable, Sendable {
         forceLogitsHead: Bool = true
     ) throws -> RuntimeConfiguration {
         guard RuntimeConfiguration.allowedExpertCacheSlots.contains(expertCacheSlots) else {
-            throw ServerArgumentError.invalid("--expert-cache-slots must be 8, 16, 24, or 32")
+            throw ServerArgumentError.notAllowed(
+                flag: "--expert-cache-slots",
+                allowed: RuntimeConfiguration.allowedExpertCacheSlots)
         }
         guard RuntimeConfiguration.allowedPrefillChunkTokens.contains(prefillChunkTokens) else {
-            throw ServerArgumentError.invalid(
-                "--prefill-chunk-tokens must be one of "
-                    + RuntimeConfiguration.allowedPrefillChunkTokens
-                        .map(String.init).joined(separator: ", "))
+            throw ServerArgumentError.notAllowed(
+                flag: "--prefill-chunk-tokens",
+                allowed: RuntimeConfiguration.allowedPrefillChunkTokens,
+                alsoAccepting: ["auto"])
         }
         guard prefillPolicy == .off
                 || expertCacheSlots >= RuntimeConfiguration.minimumExpertCacheSlotsForChunkedPrefill
@@ -74,7 +90,11 @@ public struct ServerArguments: Equatable, Sendable {
             forceLogitsHead: forceLogitsHead)
     }
 
-    public static func parse(_ input: [String]) throws -> ServerArguments {
+    public static func parse(
+        _ input: [String],
+        hostMemoryBytes: UInt64 = ContextAdmission.hostMemoryBytes,
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) throws -> ServerArguments {
         let runtimeDefaults = RuntimeConfiguration.production
         var model: String?
         var host = "127.0.0.1"
@@ -119,7 +139,7 @@ public struct ServerArguments: Equatable, Sendable {
                 modelID = value
             case "--max-context":
                 guard let parsed = Int(value),
-                      [4_096, 8_192, 16_384, 32_768, 65_536].contains(parsed) else {
+                      allowedMaxContext.contains(parsed) else {
                     throw ServerArgumentError.invalid("--max-context is not supported")
                 }
                 maxContext = parsed
@@ -145,7 +165,9 @@ public struct ServerArguments: Equatable, Sendable {
             case "--expert-cache-slots":
                 guard let parsed = Int(value),
                       RuntimeConfiguration.allowedExpertCacheSlots.contains(parsed) else {
-                    throw ServerArgumentError.invalid("--expert-cache-slots must be 8, 16, 24, or 32")
+                    throw ServerArgumentError.notAllowed(
+                        flag: flag,
+                        allowed: RuntimeConfiguration.allowedExpertCacheSlots)
                 }
                 expertCacheSlots = parsed
             case "--expert-cache-policy":
@@ -160,12 +182,25 @@ public struct ServerArguments: Equatable, Sendable {
                 default: throw ServerArgumentError.invalid("--prefill must be on or off")
                 }
             case "--prefill-chunk-tokens":
+                // `auto` is an alias for the cap here, and nothing downstream
+                // learns it was spelled that way. A per-request size is the
+                // smallest allowed size that covers the span, so the cap
+                // prefills every prompt in exactly the spans that size would,
+                // and the KV ring is sized from the cap either way. The prefill
+                // scratch is the one thing a per-request size changes: it is
+                // allocated from the chunk, about 125.5 KB per token over a
+                // fixed 328 KB, and the
+                // server would reallocate it on every size change.
+                if value == "auto" {
+                    prefillChunkTokens = PrefillRuntimeConfig.maxChunkTokens
+                    break
+                }
                 guard let parsed = Int(value),
                       RuntimeConfiguration.allowedPrefillChunkTokens.contains(parsed) else {
-                    throw ServerArgumentError.invalid(
-                        "--prefill-chunk-tokens must be one of "
-                            + RuntimeConfiguration.allowedPrefillChunkTokens
-                                .map(String.init).joined(separator: ", "))
+                    throw ServerArgumentError.notAllowed(
+                        flag: flag,
+                        allowed: RuntimeConfiguration.allowedPrefillChunkTokens,
+                        alsoAccepting: ["auto"])
                 }
                 prefillChunkTokens = parsed
             case "--rdadvise":
@@ -179,6 +214,21 @@ public struct ServerArguments: Equatable, Sendable {
             }
         }
         guard let model else { throw ServerArgumentError.invalid("--model is required") }
+        // Refused here rather than at load: the KV allocation for a context the
+        // host cannot back fails deep inside the runtime, after the model has
+        // already started loading, with an allocator error that says nothing
+        // about how much memory the choice actually needs.
+        let config = ArchConfig.gemma4_26B_A4B
+        if case .needsMemory = ContextAdmission.availability(config: config,
+                                                             maxContext: maxContext,
+                                                             hostMemoryBytes: hostMemoryBytes, expertCacheSlots: expertCacheSlots),
+           environment[unbackedContextOverrideVariable] != "1" {
+            throw ServerArgumentError.invalid(
+                ContextAdmission.needDescription(config: config,
+                                                 maxContext: maxContext,
+                                                 hostMemoryBytes: hostMemoryBytes, expertCacheSlots: expertCacheSlots)
+                    + " Set \(unbackedContextOverrideVariable)=1 to start anyway.")
+        }
         return ServerArguments(model: model,
                                host: host,
                                port: port,
@@ -205,5 +255,14 @@ public enum ServerArgumentError: Error, Equatable, CustomStringConvertible {
         case .help: "help"
         case .invalid(let message): message
         }
+    }
+}
+
+extension ServerArgumentError {
+    static func notAllowed(flag: String,
+                           allowed: [Int],
+                           alsoAccepting aliases: [String] = []) -> ServerArgumentError {
+        .invalid("\(flag) must be "
+            + RuntimeConfiguration.allowedValueList(allowed, alsoAccepting: aliases))
     }
 }

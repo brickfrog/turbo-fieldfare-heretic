@@ -168,6 +168,9 @@ all affect decode speed.
 | [Benjamin Schilling](https://github.com/benjamin-schilling) · [issue #27](https://github.com/drumih/turbo-fieldfare/issues/27) | M3 Pro MacBook Pro | 18 GB | Internal SSD | 61 / 516 | 19.09 tok/s | One submitted run |
 | [Benjamin Schilling](https://github.com/benjamin-schilling) · [issue #27](https://github.com/drumih/turbo-fieldfare/issues/27) | M3 Pro MacBook Pro | 18 GB | Internal SSD | 430 / 780 | 16.50 tok/s | One submitted run |
 | [Benjamin Schilling](https://github.com/benjamin-schilling) · [issue #27](https://github.com/drumih/turbo-fieldfare/issues/27) | M3 Pro MacBook Pro | 18 GB | Internal SSD | 3,015 / 617 | 13.88 tok/s | One submitted run |
+| [castillovas-arch](https://github.com/castillovas-arch) · [issue #172](https://github.com/drumih/turbo-fieldfare/issues/172) | M4 Mac mini | 16 GB | Internal SSD | 61 / 489 | 11.649 tok/s | One measured run after one discarded warmup |
+| [castillovas-arch](https://github.com/castillovas-arch) · [issue #172](https://github.com/drumih/turbo-fieldfare/issues/172) | M4 Mac mini | 16 GB | Internal SSD | 430 / 760 | 10.119 tok/s | One measured run after one discarded warmup |
+| [castillovas-arch](https://github.com/castillovas-arch) · [issue #172](https://github.com/drumih/turbo-fieldfare/issues/172) | M4 Mac mini | 16 GB | Internal SSD | 3,015 / 594 | 8.058 tok/s | One measured run after one discarded warmup |
 | [gandalfk7](https://github.com/gandalfk7) · [issue #95](https://github.com/drumih/turbo-fieldfare/issues/95) | M4 Mac mini | 16 GB | Internal 256 GB SSD | 61 / 516 | 10.847 tok/s | One submitted run |
 | [gandalfk7](https://github.com/gandalfk7) · [issue #95](https://github.com/drumih/turbo-fieldfare/issues/95) | M4 Mac mini | 16 GB | Internal 256 GB SSD | 430 / 780 | 9.878 tok/s | One submitted run |
 | [gandalfk7](https://github.com/gandalfk7) · [issue #95](https://github.com/drumih/turbo-fieldfare/issues/95) | M4 Mac mini | 16 GB | Internal 256 GB SSD | 3,015 / 617 | 8.658 tok/s | One submitted run |
@@ -180,6 +183,9 @@ all affect decode speed.
 | [dragonwang1019](https://github.com/dragonwang1019) · [issue #101](https://github.com/drumih/turbo-fieldfare/issues/101) | M4 Pro Mac mini | 24 GB | External NVMe SSD | 61 / 516 | 22.256 tok/s | One submitted run |
 | [dragonwang1019](https://github.com/dragonwang1019) · [issue #101](https://github.com/drumih/turbo-fieldfare/issues/101) | M4 Pro Mac mini | 24 GB | External NVMe SSD | 430 / 780 | 28.964 tok/s | One submitted run |
 | [dragonwang1019](https://github.com/dragonwang1019) · [issue #101](https://github.com/drumih/turbo-fieldfare/issues/101) | M4 Pro Mac mini | 24 GB | External NVMe SSD | 3,015 / 617 | 24.209 tok/s | One submitted run |
+| [r1tz](https://github.com/r1tz) · [issue #175](https://github.com/drumih/turbo-fieldfare/issues/175) | M4 Pro Mac mini | 24 GB | Not reported | 61 / 489 | 33.343 tok/s | One submitted run |
+| [r1tz](https://github.com/r1tz) · [issue #175](https://github.com/drumih/turbo-fieldfare/issues/175) | M4 Pro Mac mini | 24 GB | Not reported | 430 / 760 | 31.236 tok/s | One submitted run |
+| [r1tz](https://github.com/r1tz) · [issue #175](https://github.com/drumih/turbo-fieldfare/issues/175) | M4 Pro Mac mini | 24 GB | Not reported | 3,015 / 594 | 25.186 tok/s | One submitted run |
 | [Marcelo Barros](https://github.com/marcelopbarros) · [issue #67](https://github.com/drumih/turbo-fieldfare/issues/67) | M4 Pro MacBook Pro | 24 GB | Internal SSD | 61 / 516 | 34.060 tok/s | Automatic mode |
 | [Marcelo Barros](https://github.com/marcelopbarros) · [issue #67](https://github.com/drumih/turbo-fieldfare/issues/67) | M4 Pro MacBook Pro | 24 GB | Internal SSD | 430 / 780 | 30.954 tok/s | Automatic mode |
 | [Marcelo Barros](https://github.com/marcelopbarros) · [issue #67](https://github.com/drumih/turbo-fieldfare/issues/67) | M4 Pro MacBook Pro | 24 GB | Internal SSD | 3,015 / 617 | 25.292 tok/s | Automatic mode |
@@ -189,6 +195,15 @@ all affect decode speed.
 | [nxexcelsior](https://github.com/nxexcelsior) · [issue #111](https://github.com/drumih/turbo-fieldfare/issues/111) | M5 MacBook Air | 24 GB | Internal SSD | 61 / 497 | 11.982 tok/s | One submitted run |
 | [nxexcelsior](https://github.com/nxexcelsior) · [issue #111](https://github.com/drumih/turbo-fieldfare/issues/111) | M5 MacBook Air | 24 GB | Internal SSD | 430 / 721 | 12.429 tok/s | One submitted run |
 | [nxexcelsior](https://github.com/nxexcelsior) · [issue #111](https://github.com/drumih/turbo-fieldfare/issues/111) | M5 MacBook Air | 24 GB | Internal SSD | 3,015 / 610 | 9.783 tok/s | One submitted run |
+| [chongdlh-pixel](https://github.com/chongdlh-pixel) · [issue #170](https://github.com/drumih/turbo-fieldfare/issues/170) | M5 Pro MacBook Pro | 24 GB | Not reported | 61 / 497 | 36.2 tok/s | Median of 3 runs, default 16 expert-cache slots |
+| [chongdlh-pixel](https://github.com/chongdlh-pixel) · [issue #170](https://github.com/drumih/turbo-fieldfare/issues/170) | M5 Pro MacBook Pro | 24 GB | Not reported | 430 / 721 | 34.0 tok/s | Median of 3 runs, default 16 expert-cache slots |
+| [chongdlh-pixel](https://github.com/chongdlh-pixel) · [issue #170](https://github.com/drumih/turbo-fieldfare/issues/170) | M5 Pro MacBook Pro | 24 GB | Not reported | 3,015 / 610 | 29.5 tok/s | Median of 3 runs, default 16 expert-cache slots |
+| [chongdlh-pixel](https://github.com/chongdlh-pixel) · [issue #170](https://github.com/drumih/turbo-fieldfare/issues/170) | M5 Pro MacBook Pro | 24 GB | Not reported | 61 / 497 | 38.9 tok/s | Median of 3 runs, 24 expert-cache slots |
+| [chongdlh-pixel](https://github.com/chongdlh-pixel) · [issue #170](https://github.com/drumih/turbo-fieldfare/issues/170) | M5 Pro MacBook Pro | 24 GB | Not reported | 430 / 721 | 36.5 tok/s | Median of 3 runs, 24 expert-cache slots |
+| [chongdlh-pixel](https://github.com/chongdlh-pixel) · [issue #170](https://github.com/drumih/turbo-fieldfare/issues/170) | M5 Pro MacBook Pro | 24 GB | Not reported | 3,015 / 610 | 31.5 tok/s | Median of 3 runs, 24 expert-cache slots |
+| [chongdlh-pixel](https://github.com/chongdlh-pixel) · [issue #170](https://github.com/drumih/turbo-fieldfare/issues/170) | M5 Pro MacBook Pro | 24 GB | Not reported | 61 / 497 | 40.8 tok/s | Median of 3 runs, 32 expert-cache slots |
+| [chongdlh-pixel](https://github.com/chongdlh-pixel) · [issue #170](https://github.com/drumih/turbo-fieldfare/issues/170) | M5 Pro MacBook Pro | 24 GB | Not reported | 430 / 721 | 38.5 tok/s | Median of 3 runs, 32 expert-cache slots |
+| [chongdlh-pixel](https://github.com/chongdlh-pixel) · [issue #170](https://github.com/drumih/turbo-fieldfare/issues/170) | M5 Pro MacBook Pro | 24 GB | Not reported | 3,015 / 610 | 33.3 tok/s | Median of 3 runs, 32 expert-cache slots |
 | [Matt Skipton](https://github.com/mattskipton) · [issue #97](https://github.com/drumih/turbo-fieldfare/issues/97) | M5 Pro MacBook Pro | 64 GB | Not reported | 61 / 497 | 37.426 tok/s | One submitted run |
 | [Matt Skipton](https://github.com/mattskipton) · [issue #97](https://github.com/drumih/turbo-fieldfare/issues/97) | M5 Pro MacBook Pro | 64 GB | Not reported | 430 / 721 | 34.194 tok/s | One submitted run |
 | [Matt Skipton](https://github.com/mattskipton) · [issue #97](https://github.com/drumih/turbo-fieldfare/issues/97) | M5 Pro MacBook Pro | 64 GB | Not reported | 3,015 / 610 | 31.485 tok/s | One submitted run |
@@ -199,3 +214,17 @@ all affect decode speed.
 These submissions use the public community prompts and generate until the end
 of the model turn. Compare rows only when the prompt and generated-token counts
 match.
+
+[Issue #172](https://github.com/drumih/turbo-fieldfare/issues/172) reports macOS
+26.6.2 (25G83), Swift 6.3.3, and commit `6c044011c24dd55595af823cfef10f26b525cfca`.
+Each measured case ran in a fresh process with the sampling settings above;
+all three ended with `stop=endOfTurn`. The reporter reviewed the outputs and
+reported no loops, repeated blocks or protocol deviations.
+
+[Issue #175](https://github.com/drumih/turbo-fieldfare/issues/175) reports a
+12-core M4 Pro Mac mini (Mac16,11), macOS 26.6.2 (25G83), Swift 6.4, and commit
+`4c6db1e698ea861609109d4bc517410ff302af46`. The attached prompt hashes match
+the frozen community prompts. All three measured runs ended with
+`stop=endOfTurn`; the attached outputs finish without obvious loops or
+repeated blocks. Storage, energy mode and other active workloads were not
+reported. These are individual submitted runs, not repeated-run averages.

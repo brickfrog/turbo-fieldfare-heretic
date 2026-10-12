@@ -39,6 +39,16 @@ A tool call from the local model never bypasses the client's normal permission
 policy. Keep the execution session alive while the server is needed, and stop
 only a server you launched.
 
+## SwiftUI state and previews
+
+Use `@StoredState` from `TurboFieldfareMacPresentation` for view-owned state.
+It aliases Apple's `SwiftUI.State<Value>` property wrapper, avoiding the State
+macro plugin missing from some CLT installations. Keep reference construction
+explicit; the wrapper evaluates inline initializers eagerly. Use
+`PreviewProvider` for debug previews. Do not introduce direct State attributes
+or Preview macros. Run `ruby Scripts/check_swiftui_macros.rb --self-test` and
+`ruby Scripts/tests/swift_macro_probe_test.rb` when changing these surfaces.
+
 ## Test rules
 
 Before a model run, require macOS 26+, Swift 6.2+, enough disk, acceptable `memory_pressure -Q`, a completed `scratch/gemma4.gturbo`, and no process from `pgrep -fl 'TurboFieldfareServer|TurboFieldfareMac|TurboFieldfareDecodeService|TurboFieldfareCLI|TurboFieldfarePackageTests|swiftpm-testing-helper|mlx_lm|mlx-lm'`. If a check fails, inform the user and stop; do not terminate apps or delete or reinstall the model.
@@ -56,8 +66,11 @@ Report the commit, hardware and RAM, macOS, Swift version, exact command, exit c
 The Mac app sends prompts through the pinned Gemma 4 IT chat format. It
 exposes context length, temperature, Top-K, Top-P, expert-cache slots, prefill,
 and RDADVISE. The defaults are temperature `0.2`, Top-K `64`, and Top-P `0.95`.
-The app retains one in-memory conversation and reuses its FP16 KV state across
-turns. The HUD shows generation rate, context use, decode-service memory, and,
+The app saves conversation history locally and retains one live FP16 KV lineage.
+Browsing the sidebar preserves that lineage; continuing another saved chat
+replays its recorded tokens and replaces it. See
+[Conversation history](README.md#conversation-history) for an overview.
+The HUD shows generation rate, context use, decode-service memory, and,
 on hover, cached-token reuse; Last run also shows time to first token and I/O.
 Use **New Chat** to clear the transcript, KV lineage, gauge, and retained
 images. Reloading or unloading keeps the transcript but marks it outside the

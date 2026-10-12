@@ -23,6 +23,29 @@ public struct RuntimeConfiguration: Sendable, Equatable {
     public static let allowedExpertCacheSlots = [8, 16, 24, 32]
     public static let allowedPrefillChunkTokens = PrefillRuntimeConfig.allowedChunkTokens
     public static let minimumExpertCacheSlotsForChunkedPrefill = 16
+    /// The one rendering shared by every help text and every rejection that
+    /// names one of the arrays above, so neither can name a value the guard
+    /// does not accept: the hardcoded "32, 64, or 128" outlived the widening of
+    /// the allowed set and told users 256 was illegal while the guard accepted
+    /// it. It lives here, beside the arrays, because the CLI's usage and the
+    /// server's usage and rejections all render the same sets.
+    ///
+    /// `alsoAccepting` appends parse-level aliases after the integers, so
+    /// `--prefill-chunk-tokens` renders "32, 64, 128, 256, or auto". They come
+    /// last because they are not members of the array the guards test, and
+    /// because the help line's integers are read back by
+    /// `usageNamesExactlyTheAllowedValues`.
+    public static func allowedValueList(_ values: [Int],
+                                        alsoAccepting aliases: [String] = []) -> String {
+        let words = values.map(String.init) + aliases
+        switch words.count {
+        case 0: return ""
+        case 1: return words[0]
+        case 2: return "\(words[0]) or \(words[1])"
+        default:
+            return words.dropLast().joined(separator: ", ") + ", or " + words[words.count - 1]
+        }
+    }
 
     public let expertCacheSlots: Int
     public let expertCachePolicy: RuntimeExpertCachePolicy

@@ -12,15 +12,26 @@ public struct ServerCompletion: Equatable, Sendable {
     public let toolCalls: [ParsedToolCall]
     public let finishReason: String
     public let usage: OpenAIUsage
+    /// Wall time the runtime spent prefilling the prompt and decoding the
+    /// completion, as `runRawCompletion` already measures them around those two
+    /// phases; nothing is timed here. Defaulted to zero so a backend that does
+    /// not decode through the runtime — the test doubles, the compatibility
+    /// harness — reports no timing rather than a fabricated one.
+    public let prefillSeconds: Double
+    public let decodeSeconds: Double
 
     public init(content: String,
                 toolCalls: [ParsedToolCall],
                 finishReason: String,
-                usage: OpenAIUsage) {
+                usage: OpenAIUsage,
+                prefillSeconds: Double = 0,
+                decodeSeconds: Double = 0) {
         self.content = content
         self.toolCalls = toolCalls
         self.finishReason = finishReason
         self.usage = usage
+        self.prefillSeconds = prefillSeconds
+        self.decodeSeconds = decodeSeconds
     }
 }
 
@@ -435,44 +446,65 @@ enum ServerRequestImages {
         return planned
     }
 
-    /// Encodes an image from the plan its count was taken from. Only an image
-    /// whose plan the open bound released is read a second time.
-    static func encode<Features>(
-        _ image: Planned,
-        fromPlan: (VisionImagePlan) throws -> Features,
-        byReopening: (URL) throws -> Features
-    ) throws -> Features {
-        guard let plan = image.plan else { return try byReopening(image.url) }
-        return try fromPlan(plan)
+    /// What an image's encode reads through.
+    enum Source {
+        /// The plan the image's count was taken from, still open.
+        case plan(VisionImagePlan)
+        /// The file again, for an image the open bound released.
+        case reopened(URL)
     }
 
-    /// Every image a full prefill needs, each read through one open file.
+    /// An image is encoded from the plan its count was taken from. Only one
+    /// whose plan the open bound released is read a second time.
     ///
-    /// A full prefill lays its spans out from the encoded features rather than
-    /// from a count, so it asked for no plan of its own and let
-    /// `encodeImage(at:)` make one per image internally — the third copy of the
-    /// pattern, and the one that also encoded its way through the images ahead
-    /// of one that could not be read at all.
-    static func encodeAll<Features>(
+    /// Returned rather than dispatched through caller-supplied closures:
+    /// Swift 6.2's region isolation rejects an actor-isolated closure that
+    /// captures a session's `VisionRuntime` and `Model` and is handed to a
+    /// nonisolated callee, which broke the build on Xcode 26.0-26.3.
+    static func source(for image: Planned) -> Source {
+        guard let plan = image.plan else { return .reopened(image.url) }
+        return .plan(plan)
+    }
+
+    /// Every image of a request planned, each still paired with the id its
+    /// features are filed under.
+    ///
+    /// The pairing is the reason this is not two statements at the call site:
+    /// `[UUID: URL]` has no order, so the ids and the plans have to be taken
+    /// from one snapshot. Pairing them from two walks of the dictionary files
+    /// one image's features under another's id, and when both project to the
+    /// same soft-token count nothing downstream can notice.
+    ///
+    /// Planning every image before the caller encodes any is the other half:
+    /// the spans are laid out from the same open files the encodes read, and a
+    /// request whose last image cannot be read at all is refused before the
+    /// tower has run on the ones ahead of it.
+    static func plannedEntries(
         _ imageFiles: [UUID: URL],
         with preprocessor: Gemma4ImagePreprocessor,
         maximumOpenPlans: Int = ServerRequestImages.maximumOpenPlans,
-        checkCancellation: () throws -> Void = {},
-        encode: (Planned) throws -> Features
-    ) throws -> [UUID: Features] {
+        checkCancellation: () throws -> Void = {}
+    ) throws -> [(id: UUID, image: Planned)] {
         let entries = Array(imageFiles)
         let planned = try plans(
             for: entries.map { $0.value },
             with: preprocessor,
             maximumOpenPlans: maximumOpenPlans,
             checkCancellation: checkCancellation)
-        var features: [UUID: Features] = [:]
-        features.reserveCapacity(entries.count)
-        for (entry, image) in zip(entries, planned) {
-            try checkCancellation()
-            features[entry.key] = try encode(image)
-        }
-        return features
+        return zip(entries, planned).map { (id: $0.key, image: $1) }
+    }
+
+    /// A file the caller supplied that cannot be read is a bad request, not a
+    /// server fault, and it stays one wherever the read fails. Admission reads
+    /// dimensions with stream verification off; the encode re-plans with it on,
+    /// so a truncated upload is admitted and only fails the second read.
+    /// Without this that second failure reached the generic handler as a 500,
+    /// which official clients retry and 4xx they do not.
+    static func requestError(forUnreadable error: any Error) -> any Error {
+        if error is ServerRequestError || error is CancellationError { return error }
+        return ServerRequestError.invalid(
+            message: "image could not be read: \(error)",
+            param: "messages", code: "invalid_image")
     }
 }
 
@@ -796,22 +828,20 @@ public actor ServerModelSession: ServerInferenceBackend {
     private func encodeTurnImage(
         _ image: ServerRequestImages.Planned, visionRuntime: VisionRuntime
     ) throws -> VisionFeatures {
-        try ServerRequestImages.encode(
-            image,
-            fromPlan: {
-                try visionRuntime.encodeImage(
-                    plan: $0,
-                    languageModel: model,
-                    residencyPolicy: visionResidencyPolicy,
-                    checkCancellation: { try Task.checkCancellation() })
-            },
-            byReopening: {
-                try visionRuntime.encodeImage(
-                    at: $0,
-                    languageModel: model,
-                    residencyPolicy: visionResidencyPolicy,
-                    checkCancellation: { try Task.checkCancellation() })
-            })
+        switch ServerRequestImages.source(for: image) {
+        case .plan(let plan):
+            return try visionRuntime.encodeImage(
+                plan: plan,
+                languageModel: model,
+                residencyPolicy: visionResidencyPolicy,
+                checkCancellation: { try Task.checkCancellation() })
+        case .reopened(let url):
+            return try visionRuntime.encodeImage(
+                at: url,
+                languageModel: model,
+                residencyPolicy: visionResidencyPolicy,
+                checkCancellation: { try Task.checkCancellation() })
+        }
     }
 
     /// Projected token count per image from headers alone; no pixel is decoded
@@ -831,12 +861,8 @@ public actor ServerModelSession: ServerInferenceBackend {
             do {
                 let geometry = try preprocessor.admissionGeometry(fileURL: url)
                 counts.append(geometry.softTokenCount)
-            } catch let error as ServerRequestError {
-                throw error
             } catch {
-                throw ServerRequestError.invalid(
-                    message: "image could not be read: \(error)",
-                    param: "messages", code: "invalid_image")
+                throw ServerRequestImages.requestError(forUnreadable: error)
             }
         }
         return counts
@@ -919,11 +945,27 @@ public actor ServerModelSession: ServerInferenceBackend {
                 param: "messages", code: "vision_unavailable")
         }
         do {
-            let features = try ServerRequestImages.encodeAll(
-                request.imageFiles,
-                with: imagePreprocessor(visionRuntime),
-                checkCancellation: { try Task.checkCancellation() },
-                encode: { try encodeTurnImage($0, visionRuntime: visionRuntime) })
+            var features: [UUID: VisionFeatures] = [:]
+            // Scoped, so the plans — up to `maximumOpenPlans` live ImageIO
+            // descriptors — are released before the render walks the whole
+            // history, rather than held across it.
+            do {
+                let planned: [(id: UUID, image: ServerRequestImages.Planned)]
+                do {
+                    planned = try ServerRequestImages.plannedEntries(
+                        request.imageFiles,
+                        with: imagePreprocessor(visionRuntime),
+                        checkCancellation: { try Task.checkCancellation() })
+                } catch {
+                    throw ServerRequestImages.requestError(forUnreadable: error)
+                }
+                features.reserveCapacity(planned.count)
+                for entry in planned {
+                    try Task.checkCancellation()
+                    features[entry.id] = try encodeTurnImage(
+                        entry.image, visionRuntime: visionRuntime)
+                }
+            }
             return try MultimodalPromptRenderer.render(
                 messages: messages,
                 featuresByID: features,
@@ -1263,7 +1305,9 @@ public actor ServerModelSession: ServerInferenceBackend {
             usage: OpenAIUsage(promptTokens: result.prefillTokens,
                                completionTokens: result.newTokens,
                                totalTokens: result.prefillTokens + result.newTokens,
-                               cachedTokens: result.cachedPromptTokens))
+                               cachedTokens: result.cachedPromptTokens),
+            prefillSeconds: result.prefillSeconds,
+            decodeSeconds: result.decodeSeconds)
     }
 
     private func renderPrompt(_ request: ValidatedChatRequest) throws -> [Int32] {

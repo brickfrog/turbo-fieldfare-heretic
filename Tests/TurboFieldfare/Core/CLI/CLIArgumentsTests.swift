@@ -24,6 +24,50 @@ import TurboFieldfare
         #expect(runtime == RuntimeConfiguration.production)
     }
 
+    /// `auto` only resolves a size where a chunked prefill will run at it.
+    /// Under `--prefill off` the config is `.off` and the size is inert, and an
+    /// image turn there is coerced to the runtime's own chunked default, so the
+    /// resolved number would be announced on stderr and then used by nothing.
+    @Test(arguments: [
+        (prefill: "on", auto: true, resolves: true),
+        (prefill: "off", auto: true, resolves: false),
+        (prefill: "on", auto: false, resolves: false),
+        (prefill: "off", auto: false, resolves: false),
+    ])
+    func autoResolvesOnlyWhenChunkedPrefillWillRun(
+        testCase: (prefill: String, auto: Bool, resolves: Bool)
+    ) throws {
+        let arguments = try Args.parse([
+            "--model", "m.gturbo", "--prompt", "hi",
+            "--prefill", testCase.prefill,
+            "--prefill-chunk-tokens", testCase.auto ? "auto" : "64",
+        ])
+        #expect(arguments.prefillChunkTokensAuto == testCase.auto)
+        #expect(arguments.resolvesPrefillChunkAuto == testCase.resolves)
+    }
+
+    /// A repeated `--prefill-chunk-tokens` is last-one-wins in both orderings.
+    /// Without the clear on the integer branch, `auto` survives a later
+    /// explicit size and the run resolves its own size over the one asked for.
+    @Test func lastPrefillChunkTokensFlagWinsInBothOrderings() throws {
+        let explicitLast = try Args.parse([
+            "--model", "m.gturbo", "--prompt", "hi",
+            "--prefill-chunk-tokens", "auto",
+            "--prefill-chunk-tokens", "64",
+        ])
+        #expect(explicitLast.prefillChunkTokens == 64)
+        #expect(explicitLast.prefillChunkTokensAuto == false)
+        #expect(explicitLast.resolvesPrefillChunkAuto == false)
+
+        let autoLast = try Args.parse([
+            "--model", "m.gturbo", "--prompt", "hi",
+            "--prefill-chunk-tokens", "64",
+            "--prefill-chunk-tokens", "auto",
+        ])
+        #expect(autoLast.prefillChunkTokensAuto)
+        #expect(autoLast.resolvesPrefillChunkAuto)
+    }
+
     @Test func generationOptionsParseAndStopsRepeat() throws {
         let arguments = try Args.parse([
             "--model", "m.gturbo", "--prompt", "hi",
@@ -288,6 +332,38 @@ import TurboFieldfare
             Issue.record("expected ArgsError.mutuallyExclusive")
         } catch let e as ArgsError {
             #expect(e == .mutuallyExclusive("--prompt", "--chat-prompt"))
+        } catch {
+            Issue.record("unexpected error: \(error)")
+        }
+    }
+
+    /// The CLI accepts the checkpoint's whole position range; nothing below
+    /// the model ceiling is the CLI's to refuse.
+    @Test func maxContextAtModelCeilingAccepted() throws {
+        let a = try Args.parse([
+            "--model", "m.gturbo",
+            "--prompt", "x",
+            "--max-context", "262144",
+        ])
+        #expect(a.maxContext == 262_144)
+        #expect(a.maxContext == ArchConfig.gemma4_26B_A4B.maxPositionEmbeddings)
+    }
+
+    /// One token past the ceiling is refused at parse time, naming both the
+    /// request and the maximum — before the model load that would otherwise
+    /// turn it into a KV allocation failure.
+    @Test func maxContextAboveModelCeilingRejected() {
+        do {
+            _ = try Args.parse([
+                "--model", "m.gturbo",
+                "--prompt", "x",
+                "--max-context", "262145",
+            ])
+            Issue.record("--max-context 262145 was accepted above the model ceiling")
+        } catch let error as ArgsError {
+            #expect(error == .contextExceedsModel(requested: 262_145, maximum: 262_144))
+            #expect(error.description.contains("262145"))
+            #expect(error.description.contains("262144"))
         } catch {
             Issue.record("unexpected error: \(error)")
         }

@@ -3,7 +3,7 @@ import TurboFieldfare
 
 struct MacAppSettings: Codable, Equatable, Sendable {
     static let fileName = "mac-app-settings.json"
-    static let currentVersion = 2
+    static let currentVersion = 3
 
     var version: Int = currentVersion
     var contextTokens: Int = AppContextLengthOption.eightK.tokens
@@ -16,6 +16,14 @@ struct MacAppSettings: Codable, Equatable, Sendable {
     var prefillEnabled: Bool = true
     var newlineShortcut: AppNewlineShortcut = .return
     var showPromptExamples: Bool = true
+    var textSize: AppTextSize = .standard
+    /// Whether the list of chats is showing. Remembered because hiding it is a
+    /// choice about how the window looks, and a window that forgot it every
+    /// launch would be making that choice again for the user each time.
+    var sidebarVisible: Bool = true
+    /// Whether the Inspector is showing. Remembered for the same reason the
+    /// sidebar is: it is a choice about the window, not about one session.
+    var inspectorVisible: Bool = true
     var visionResidencyPolicy: VisionResidencyPolicy = .onDemand
     var rdadvisePolicy: AppRDAdvicePolicy = .off
     var loadModelOnLaunch: Bool = false
@@ -32,6 +40,9 @@ struct MacAppSettings: Codable, Equatable, Sendable {
         case prefillEnabled
         case newlineShortcut
         case showPromptExamples
+        case textSize
+        case sidebarVisible
+        case inspectorVisible
         case visionResidencyPolicy
         case rdadvisePolicy
         case loadModelOnLaunch
@@ -48,6 +59,9 @@ struct MacAppSettings: Codable, Equatable, Sendable {
          prefillEnabled: Bool = true,
          newlineShortcut: AppNewlineShortcut = .return,
          showPromptExamples: Bool = true,
+         textSize: AppTextSize = .standard,
+         sidebarVisible: Bool = true,
+         inspectorVisible: Bool = true,
          visionResidencyPolicy: VisionResidencyPolicy = .onDemand,
          rdadvisePolicy: AppRDAdvicePolicy = .off,
          loadModelOnLaunch: Bool = false) {
@@ -62,6 +76,9 @@ struct MacAppSettings: Codable, Equatable, Sendable {
         self.prefillEnabled = prefillEnabled
         self.newlineShortcut = newlineShortcut
         self.showPromptExamples = showPromptExamples
+        self.textSize = textSize
+        self.sidebarVisible = sidebarVisible
+        self.inspectorVisible = inspectorVisible
         self.visionResidencyPolicy = visionResidencyPolicy
         self.rdadvisePolicy = rdadvisePolicy
         self.loadModelOnLaunch = loadModelOnLaunch
@@ -84,6 +101,27 @@ struct MacAppSettings: Codable, Equatable, Sendable {
         showPromptExamples = try container.decodeIfPresent(
             Bool.self,
             forKey: .showPromptExamples) ?? true
+        // A damaged appearance preference must not reach settings-wide recovery,
+        // which discards the file and would reset unrelated runtime choices.
+        // Foundation can throw a non-DecodingError for a fractional integer.
+        if container.contains(.textSize) {
+            do {
+                textSize = try container.decode(AppTextSize.self, forKey: .textSize)
+            } catch {
+                FileHandle.standardError.write(Data(
+                    "Invalid Mac app setting textSize: unsupported value or type; using 100%.\n".utf8))
+                textSize = .standard
+            }
+        }
+        // Additive, like every field around it: absent means the default, so
+        // no version bump and no rewrite of a file an older build can still
+        // read.
+        sidebarVisible = try container.decodeIfPresent(
+            Bool.self,
+            forKey: .sidebarVisible) ?? true
+        inspectorVisible = try container.decodeIfPresent(
+            Bool.self,
+            forKey: .inspectorVisible) ?? true
         visionResidencyPolicy = try container.decodeIfPresent(
             VisionResidencyPolicy.self,
             forKey: .visionResidencyPolicy) ?? .onDemand
