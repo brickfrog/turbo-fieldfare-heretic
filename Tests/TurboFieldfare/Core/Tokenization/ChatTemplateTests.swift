@@ -15,6 +15,42 @@ struct ChatTemplateTests {
 
     private typealias Message = GFTokenizer.Message
 
+    // Validation accepted these requests, but rendering rejected their second
+    // system message before generation could begin. Local behavior: leading
+    // system messages are trimmed, blanks dropped, and the rest joined in order
+    // into a single system turn.
+    @Test(arguments: 0...3)
+    func leadingSystemTurnsPreserveGuidanceOrder(_ count: Int) throws {
+        let instructions = ["  Be terse.\n", "\t", " Réponds en français. "]
+        let messages = instructions.prefix(count).map { Message(role: .system, content: $0) }
+            + [Message(role: .user, content: "Hi")]
+        let joined = instructions.prefix(count)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+            .joined(separator: "\n")
+        let expected = "<bos>" + (joined.isEmpty ? "" : "<|turn>system\n" + joined + "<turn|>\n")
+            + "<|turn>user\nHi<turn|>\n<|turn>model\n<|channel>thought\n<channel|>"
+        let rendered = try tok.applyChatTemplate(messages)
+        #expect(rendered == expected)
+        #expect(tok.encode(rendered, addBOS: false) == tok.encode(expected, addBOS: false))
+    }
+
+    // Local behavior: guidance after the conversation starts keeps its position
+    // as a user turn instead of being rejected.
+    @Test(arguments: [GFTokenizer.Role.user, .assistant, .tool])
+    func guidanceAfterConversationRendersInPlace(_ role: GFTokenizer.Role) throws {
+        let rendered = try tok.applyChatTemplate([
+            Message(role: .system, content: "first"),
+            Message(role: role, content: "conversation"),
+            Message(role: .system, content: "late"),
+        ])
+        let roleName = role == .assistant ? "model" : role.rawValue
+        #expect(rendered == "<bos><|turn>system\nfirst<turn|>\n"
+            + "<|turn>\(roleName)\nconversation<turn|>\n"
+            + "<|turn>user\nlate<turn|>\n"
+            + "<|turn>model\n<|channel>thought\n<channel|>")
+    }
+
     @Test("Single user turn has the documented marker structure")
     func singleUserTurn() throws {
         let p = try tok.applyChatTemplate([Message(role: .user, content: "Hi")])

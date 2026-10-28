@@ -1088,7 +1088,7 @@ public actor ServerModelSession: ServerInferenceBackend {
                 // the cached prefix is untouched and stays valid for the retry.
                 throw CancellationError()
             } catch {
-                ServerLog.promptCacheBridgeFailed(error: error)
+                ServerLog.promptCacheMiss(reason: .continuationBridgeUnavailable)
                 promptCache.invalidate()
                 let rendered = try await renderMultimodal(request)
                 effectivePromptIDs = rendered.effectiveTokenIDs
@@ -1274,13 +1274,14 @@ public actor ServerModelSession: ServerInferenceBackend {
         // `imagesDiverged` rather than resumed onto a KV built from a different
         // picture.
         if promptCacheMode == .singlePrefix {
-            promptCache.publish(
+            let publication = promptCache.publish(
                 domain: promptCacheDomain,
                 request: request,
                 content: content,
                 calls: calls,
                 result: result,
                 stopStringFiltered: stopMatcher.isStopped)
+            ServerLog.promptCachePublication(publication)
             // Retain both KV states of this turn: the pre-generation one lets a
             // swipe replay it, the post-generation one lets an aborted next
             // turn roll back to it.
